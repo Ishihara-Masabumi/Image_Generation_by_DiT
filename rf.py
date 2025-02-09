@@ -1,8 +1,8 @@
 # implementation of Rectified Flow for simple minded people like me.
 import argparse
-
 import torch
-
+import torch.nn.functional as F
+from tqdm import tqdm
 
 class RF:
     def __init__(self, model, ln=True):
@@ -26,12 +26,12 @@ class RF:
         return batchwise_mse.mean(), ttloss
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
+    def sample(self, z, cond, null_cond, sample_steps=50, cfg=2.0):
         b = z.size(0)
         dt = 1.0 / sample_steps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
         images = [z]
-        for i in range(sample_steps, 0, -1):
+        for i in tqdm(reversed(range(sample_steps)), desc='sampling loop time step', total=sample_steps):
             t = i / sample_steps
             t = torch.tensor([t] * b).to(z.device)
 
@@ -44,91 +44,201 @@ class RF:
             images.append(z)
         return images
 
+import argparse
+import json
+import os
+from pathlib import Path
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid, save_image
+from PIL import Image
+from dit import DiT_Llama
 
-if __name__ == "__main__":
-    # train class conditional RF on mnist.
-    import numpy as np
-    import torch.optim as optim
-    from PIL import Image
-    from torch.utils.data import DataLoader
-    from torchvision import datasets, transforms
-    from torchvision.utils import make_grid
-    from tqdm import tqdm
+# ここで DiT_Llama や RF を適切にインポート（または定義）してください。
+# 例:
+# from dit import DiT_Llama, RF
 
-    import wandb
-    from dit import DiT_Llama
+# -------------------------------
+# Main function: 設定ファイルの読み込みと学習処理
+# -------------------------------
+import argparse
+import json
+from pathlib import Path
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms as T
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
+from PIL import Image
 
-    parser = argparse.ArgumentParser(description="use cifar?")
-    parser.add_argument("--cifar", action="store_true")
+# ※ 必要なクラス（DiT_Llama, DDPM, RFなど）は各自の実装・インポート済みとします。
+# 例:
+# from my_model import DiT_Llama, RF
+
+def main():
+    import sys
+    sys.argv = ['script.py', '--dataset', 'mnist']
+
+    # コマンドライン引数でデータセットを選択
+    parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
+    parser.add_argument("--dataset", type=str, default="mnist",
+                        choices=["mnist", "cifar", "fashion_mnist", "huggan"],
+                        help="Dataset to use (default: mnist)")
     args = parser.parse_args()
-    CIFAR = args.cifar
 
-    if CIFAR:
-        dataset_name = "cifar"
-        fdatasets = datasets.CIFAR10
-        transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.RandomCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.Normalize((0.5,), (0.5,)),
-            ]
-        )
-        channels = 3
-        model = DiT_Llama(
-            channels, 32, dim=256, n_layers=10, n_heads=8, num_classes=10
-        ).cuda()
-
+    # 選択された dataset に対応する config ファイルのパスを設定
+    if args.dataset == "mnist":
+        config_path = "./configs/mnist.json"
+    elif args.dataset == "cifar":
+        config_path = "./configs/cifar.json"
+    elif args.dataset == "fashion_mnist":
+        config_path = "./configs/fashion_mnist.json"
+    elif args.dataset == "huggan":
+        config_path = "./configs/huggan_AFHQv2.json"
     else:
+        raise ValueError("Unknown dataset")
+
+    # 設定ファイルの読み込み
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # device の設定
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # config から画像サイズ、バッチサイズなどを取得
+    image_size = config["image_size"]
+    batch_size = config["batch_size"]
+
+    # モデルの in_channels（チャネル数）は config["model"]["in_channels"] を使用
+    channels = config["model"]["in_channels"]
+
+    # データセットと前処理の設定（config["dataset"] も参考に）
+    if config["dataset"] in ["cifar"]:
+        dataset_name = "cifar"
+        fdataset = datasets.CIFAR10
+        transform = T.Compose([
+            T.RandomCrop(image_size, padding=4),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
+    elif config["dataset"] in ["fashion_mnist"]:
+        dataset_name = "fashion_mnist"
+        fdataset = datasets.FashionMNIST
+        transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
+    elif config["dataset"] in ["huggan", "huggan/AFHQv2"]:
+        from datasets import load_dataset
+        from torchvision import transforms
+        # データセットのロード
+        fdataset = load_dataset("huggan/afhqv2")
+        dataset = fdataset["train"]
+        # ラベルが 0 のサンプルのみ抽出する処理（例：0が「猫」を表す場合）
+        dataset = dataset.filter(lambda x: x["label"] == 0)
+        # torchvision の transform を定義
+        transform = transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        # 各サンプルに対して transform を適用する関数
+        def apply_transform(example):
+            example["image"] = transform(example["image"])
+            return example
+        # map() を使って transform を適用
+        dataset = dataset.map(apply_transform)
+        # PyTorch 用にフォーマットを設定
+        dataset.set_format("torch", columns=["image", "label"])
+    else:  # デフォルトは mnist
         dataset_name = "mnist"
-        fdatasets = datasets.MNIST
-        transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Pad(2),
-                transforms.Normalize((0.5,), (0.5,)),
-            ]
-        )
-        channels = 1
-        model = DiT_Llama(
-            channels, 32, dim=64, n_layers=6, n_heads=4, num_classes=10
-        ).cuda()
+        fdataset = datasets.MNIST
+        transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.ToTensor(),
+            T.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
 
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Number of parameters: {model_size}, {model_size / 1e6}M")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    rf = RF(model)
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
-    criterion = torch.nn.MSELoss()
+    # モデルの構成：config["model"] 内のパラメータを使用して DiT_Llama を初期化
+    model_config = config["model"]
+    model = DiT_Llama(
+        in_channels=model_config["in_channels"],
+        input_size=model_config["input_size"],
+        patch_size=model_config["patch_size"],
+        dim=model_config["dim"],
+        n_layers=model_config["n_layers"],
+        n_heads=model_config["n_heads"],
+        multiple_of=model_config["multiple_of"],
+        ffn_dim_multiplier=model_config["ffn_dim_multiplier"],
+        norm_eps=model_config["norm_eps"],
+        class_dropout_prob=model_config["class_dropout_prob"],
+        num_classes=model_config["num_classes"]
+    ).to(device)
 
-    mnist = fdatasets(root="./data", train=True, download=True, transform=transform)
-    dataloader = DataLoader(mnist, batch_size=64, shuffle=True, drop_last=True)
+    # 学習パラメータ：config["training"]
+    training_config = config["training"]
+    epochs = training_config["epochs"]
+    lr = training_config["learning_rate"]
 
-    wandb.init(project=f"rf_{dataset_name}")
+    # 出力先ディレクトリの作成（config の output_dir などを利用）
+    output_dir = "outputs"
+    img_dir = Path(output_dir, f"{config['dataset']}")
+    img_dir.mkdir(exist_ok=True, parents=True)
 
-    for epoch in range(100):
-        lossbin = {i: 0 for i in range(10)}
-        losscnt = {i: 1e-6 for i in range(10)}
-        for i, (x, c) in tqdm(enumerate(dataloader)):
-            x, c = x.cuda(), c.cuda()
+    # ここまでが設定ファイルの読み込み、データセットの前処理、データローダーからの読み出し、
+    # モデルへの入力まで、DDPMコードと同一の処理です。
+
+    ############################################
+    # 以下、Rectified Flow (RF) の学習処理部分に修正
+    ############################################
+
+    # RF クラスの初期化（RFは model をラップするクラスとする）
+    rf = RF(model)  # RF クラスの実装に依存します
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    #criterion = torch.nn.MSELoss()
+
+    # 学習ループ
+    for epoch in range(1, epochs + 1):
+        losses = []
+        bar = tqdm(dataloader, desc=f"Epoch {epoch}", total=len(dataloader))
+        model.train()
+
+        for batch in bar: # この行を変更
+
+            if config["dataset"] in ["huggan/AFHQv2", "huggan"]:
+                x = batch['image'].type(torch.float32).to(device)  # (B, C, H, W)
+                # ラベル c はデータセットによっては異なる形式の場合があるので、Tensor であればデバイスに移動
+                if isinstance(batch['label'], torch.Tensor):
+                    c = batch['label'].to(device)
+                else:
+                    c = torch.tensor(batch['label']).to(device) # ラベルがテンソルでない場合はテンソルに変換
+                    # また、ここでの bar を batch に変更して、一貫性を保ちました
+            else:
+                x, c = batch # この行を変更してタプルをアンパックするようにしました
+                x = x.to(device)  # (B, C, H, W)
+                # ラベル c はデータセットによっては異なる形式の場合があるので、Tensor であればデバイスに移動
+                if isinstance(c, torch.Tensor):
+                    c = c.to(device)
+
             optimizer.zero_grad()
             loss, blsct = rf.forward(x, c)
             loss.backward()
             optimizer.step()
+            losses.append(loss.item())
+            bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
-            wandb.log({"loss": loss.item()})
-
-            # count based on t
-            for t, l in blsct:
-                lossbin[int(t * 10)] += l
-                losscnt[int(t * 10)] += 1
-
-        # log
-        for i in range(10):
-            print(f"Epoch: {epoch}, {i} range loss: {lossbin[i] / losscnt[i]}")
-
-        wandb.log({f"lossbin_{i}": lossbin[i] / losscnt[i] for i in range(10)})
-
+        # サンプル生成
         rf.model.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % 10
@@ -136,26 +246,20 @@ if __name__ == "__main__":
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
             images = rf.sample(init_noise, cond, uncond)
-            # image sequences to gif
-            gif = []
-            for image in images:
-                # unnormalize
-                image = image * 0.5 + 0.5
-                image = image.clamp(0, 1)
-                x_as_image = make_grid(image.float(), nrow=4)
-                img = x_as_image.permute(1, 2, 0).cpu().numpy()
-                img = (img * 255).astype(np.uint8)
-                gif.append(Image.fromarray(img))
 
-            gif[0].save(
-                f"contents/sample_{epoch}.gif",
-                save_all=True,
-                append_images=gif[1:],
-                duration=100,
-                loop=0,
-            )
-
-            last_img = gif[-1]
-            last_img.save(f"contents/sample_{epoch}_last.png")
+            # 生成された画像列のうち、最終ステップの画像を使用
+            final_image = images[-1]
+            # 画像の値を [-1, 1] から [0, 1] に戻す（unnormalize）
+            final_image = final_image * 0.5 + 0.5
+            final_image = final_image.clamp(0, 1)
+            # 複数画像の場合は、グリッド状にまとめる（ここでは 4 枚ずつのグリッド）
+            grid = make_grid(final_image.float(), nrow=4)
+            # 画像を保存
+            save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
 
         rf.model.train()
+
+    print("Training complete.")
+
+if __name__ == "__main__":
+    main()
