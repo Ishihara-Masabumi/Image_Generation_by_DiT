@@ -57,10 +57,6 @@ from torchvision.utils import make_grid, save_image
 from PIL import Image
 from dit import DiT_Llama
 
-# ここで DiT_Llama や RF を適切にインポート（または定義）してください。
-# 例:
-# from dit import DiT_Llama, RF
-
 # -------------------------------
 # Main function: 設定ファイルの読み込みと学習処理
 # -------------------------------
@@ -75,13 +71,9 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from PIL import Image
 
-# ※ 必要なクラス（DiT_Llama, DDPM, RFなど）は各自の実装・インポート済みとします。
-# 例:
-# from my_model import DiT_Llama, RF
-
 def main():
     import sys
-    sys.argv = ['script.py', '--dataset', 'mnist']
+    sys.argv = ['script.py', '--dataset', 'cifar']
 
     # コマンドライン引数でデータセットを選択
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")

@@ -17,7 +17,7 @@
         "num_classes": 11
     },
     "training": {
-        "epochs": 15,
+        "epochs": 100,
         "learning_rate": 0.0005
     }
 }
