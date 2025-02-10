@@ -136,7 +136,7 @@ class DDPM:
 ########################################
 def main():
     import sys
-    sys.argv = ['script.py', '--dataset', 'huggan']
+    #sys.argv = ['script.py', '--dataset', 'huggan']
 
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
     parser.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "cifar", "fashion_mnist", "huggan"],
