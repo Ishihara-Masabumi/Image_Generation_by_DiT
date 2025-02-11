@@ -64,7 +64,7 @@ class DDPM:
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
     @torch.no_grad()
-    def p_sample(self, x, t, c, t_index):
+    def p_sample(self, x, t, c, t_index, nc, cfg=2.0):
         """
         逆拡散の1ステップ:
           x_{t-1} = 1/sqrt(alpha_t) * [ x_t - (1-alpha_t)*model(x_t, t, c) / sqrt(1-alphas_cumprod_t) ] + ...
@@ -74,7 +74,14 @@ class DDPM:
         sqrt_one_minus_alphas_cumprod_t = self.extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
         sqrt_recip_alphas_t = self.extract(self.sqrt_recip_alphas, t, x.shape)
 
-        model_out = self.model(x, t.float(), c)
+        vc = self.model(x, t.float(), c)
+
+        # Classifier Free Guidance
+        if nc is not None:
+            vu = self.model(x, t.float(), nc)
+            vc = vu + cfg * (vc - vu)
+        model_out = vc
+
         model_mean = sqrt_recip_alphas_t * (x - betas_t * model_out / sqrt_one_minus_alphas_cumprod_t)
 
         if t_index == 0:
@@ -85,7 +92,7 @@ class DDPM:
             return model_mean + torch.sqrt(posterior_variance_t) * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, c):
+    def p_sample_loop(self, shape, c, nc, cfg):
         """
         純粋ノイズ x_T から始めて、t = T-1 ... 0 まで逆拡散
          shape: (B, C, H, W)
@@ -97,18 +104,19 @@ class DDPM:
 
         for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
             t = torch.full((b,), i, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, c, i)
+            img = self.p_sample(img, t, c, i, nc, cfg)
+
         return img.clamp(-1, 1)
 
     @torch.no_grad()
-    def sample(self, image_size, c, batch_size=16, channels=1):
+    def sample(self, image_size, c, nc, batch_size=16, channels=1, cfg=2.0):
         """
         指定したラベル c (shape = [B]) で画像をサンプルする
          - image_size: 画像の高さ・幅（正方形）
          - c: (B,) 各サンプルのクラスラベル
         """
         shape = (batch_size, channels, image_size, image_size)
-        return self.p_sample_loop(shape, c)
+        return self.p_sample_loop(shape, c, nc, cfg)
 
     def p_losses(self, x_start, t, c, noise=None, loss_type="l2"):
         """
@@ -163,6 +171,8 @@ def main():
     # configに基づくデータセットと変換の設定
     image_size = config["image_size"]
     batch_size = config["batch_size"]
+    timesteps=config["timesteps"]
+    cfg=config["cfg"]
 
     # モデルの in_channels は config["model"]["in_channels"] とする
     channels = config["model"]["in_channels"]
@@ -232,7 +242,7 @@ def main():
         ffn_dim_multiplier=model_config["ffn_dim_multiplier"],
         norm_eps=model_config["norm_eps"],
         class_dropout_prob=model_config["class_dropout_prob"],
-        num_classes=model_config["num_classes"]
+        num_classes=model_config["num_classes"] + 1
     ).to(device)
 
     # configに基づく学習パラメータ
@@ -246,7 +256,7 @@ def main():
     img_dir.mkdir(exist_ok=True, parents=True)
 
     # DDPMクラスの初期化およびオプティマイザ設定
-    ddpm = DDPM(model, timesteps=1000, beta_start=1e-4, beta_end=0.02)
+    ddpm = DDPM(model, timesteps=timesteps, beta_start=1e-4, beta_end=0.02)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
 
     for epoch in range(1, epochs + 1):
@@ -283,9 +293,9 @@ def main():
 
         model.eval()
         with torch.no_grad():
-            # サンプル生成時はランダムなラベル（または固定ラベル）を使用
-            c_gen = torch.randint(0, model_config["num_classes"], (16,), device=device, dtype=torch.long)
-            samples = ddpm.sample(image_size, c_gen, batch_size=16, channels=channels)
+            cond = torch.arange(0, 16).cuda() % 10
+            uncond = torch.ones_like(cond) * 10
+            samples = ddpm.sample(image_size, cond, uncond, batch_size=16, channels=channels, cfg=cfg)
             samples = (samples + 1) / 2  # [-1, 1] -> [0, 1]
             grid = make_grid(samples, nrow=4)
             save_image(grid, img_dir / f"sample_{epoch}.png")

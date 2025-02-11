@@ -36,6 +36,8 @@ class RF:
             t = torch.tensor([t] * b).to(z.device)
 
             vc = self.model(z, t, cond)
+
+            # Classifier Free Guidance
             if null_cond is not None:
                 vu = self.model(z, t, null_cond)
                 vc = vu + cfg * (vc - vu)

@@ -3,6 +3,8 @@
   "image_size": 32,
   "channels": 1,
   "batch_size": 128,
+  "timesteps": 1000,
+  "cfg": 1.1,
   "model": {
     "in_channels": 1,
     "input_size": 32,
@@ -14,7 +16,7 @@
     "ffn_dim_multiplier": null,
     "norm_eps": 1e-5,
     "class_dropout_prob": 0.0,
-    "num_classes": 11
+    "num_classes": 10
   },
   "training": {
     "epochs": 100,
