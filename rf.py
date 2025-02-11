@@ -177,7 +177,7 @@ def main():
         ffn_dim_multiplier=model_config["ffn_dim_multiplier"],
         norm_eps=model_config["norm_eps"],
         class_dropout_prob=model_config["class_dropout_prob"],
-        num_classes=model_config["num_classes"]
+        num_classes=model_config["num_classes"] + 1
     ).to(device)
 
     # 学習パラメータ：config["training"]
@@ -235,8 +235,8 @@ def main():
         # サンプル生成
         rf.model.eval()
         with torch.no_grad():
-            cond = torch.arange(0, 16).cuda() % 10
-            uncond = torch.ones_like(cond) * 10
+            cond = torch.arange(0, 16).cuda() % model_config["num_classes"]
+            uncond = torch.ones_like(cond) * model_config["num_classes"]
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
             images = rf.sample(init_noise, cond, uncond)

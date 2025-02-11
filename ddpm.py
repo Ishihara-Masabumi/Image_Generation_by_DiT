@@ -293,8 +293,8 @@ def main():
 
         model.eval()
         with torch.no_grad():
-            cond = torch.arange(0, 16).cuda() % 10
-            uncond = torch.ones_like(cond) * 10
+            cond = torch.arange(0, 16).cuda() % model_config["num_classes"]
+            uncond = torch.ones_like(cond) * model_config["num_classes"]
             samples = ddpm.sample(image_size, cond, uncond, batch_size=16, channels=channels, cfg=cfg)
             samples = (samples + 1) / 2  # [-1, 1] -> [0, 1]
             grid = make_grid(samples, nrow=4)
