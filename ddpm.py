@@ -64,7 +64,7 @@ class DDPM:
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
     @torch.no_grad()
-    def p_sample(self, x, t, c, t_index, nc, cfg=2.0):
+    def p_sample(self, x, t, c, nc, cfg=2.0):
         """
         逆拡散の1ステップ:
           x_{t-1} = 1/sqrt(alpha_t) * [ x_t - (1-alpha_t)*model(x_t, t, c) / sqrt(1-alphas_cumprod_t) ] + ...
@@ -84,7 +84,7 @@ class DDPM:
 
         model_mean = sqrt_recip_alphas_t * (x - betas_t * model_out / sqrt_one_minus_alphas_cumprod_t)
 
-        if t_index == 0:
+        if t[0].item() == 0:
             return model_mean
         else:
             posterior_variance_t = self.extract(self.posterior_variance, t, x.shape)
@@ -104,19 +104,19 @@ class DDPM:
 
         for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
             t = torch.full((b,), i, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, c, i, nc, cfg)
+            img = self.p_sample(img, t, c, nc, cfg)
 
         return img.clamp(-1, 1)
 
     @torch.no_grad()
-    def sample(self, image_size, c, nc, batch_size=16, channels=1, cfg=2.0):
+    def sample(self, image_size, c, nc, batch_size=16, channels=1, cfg=2.0): # ncパラメータを追加
         """
         指定したラベル c (shape = [B]) で画像をサンプルする
          - image_size: 画像の高さ・幅（正方形）
          - c: (B,) 各サンプルのクラスラベル
         """
         shape = (batch_size, channels, image_size, image_size)
-        return self.p_sample_loop(shape, c, nc, cfg)
+        return self.p_sample_loop(shape, c, nc, cfg) # ncとcfgをp_sample_loopに渡す
 
     def p_losses(self, x_start, t, c, noise=None, loss_type="l2"):
         """
