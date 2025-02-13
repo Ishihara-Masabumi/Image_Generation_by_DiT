@@ -5,9 +5,10 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 class RF:
-    def __init__(self, model, ln=True):
+    def __init__(self, model, timesteps, ln=True):
         self.model = model
         self.ln = ln
+        self.timesteps = timesteps
 
     def forward(self, x, cond):
         b = x.size(0)
@@ -26,13 +27,13 @@ class RF:
         return batchwise_mse.mean(), ttloss
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond, sample_steps=50, cfg=2.0):
+    def sample(self, z, cond, null_cond, cfg=2.0):
         b = z.size(0)
         dt = 1.0 / sample_steps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
         images = [z]
-        for i in tqdm(reversed(range(sample_steps)), desc='sampling loop time step', total=sample_steps):
-            t = i / sample_steps
+        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
+            t = i / self.timesteps
             t = torch.tensor([t] * b).to(z.device)
 
             vc = self.model(z, t, cond)
@@ -104,12 +105,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # config から画像サイズ、バッチサイズなどを取得
-    image_size = config["image_size"]
     batch_size = config["batch_size"]
+    timesteps=config["timesteps"]
+    cfg=config["cfg"]
 
     # モデルの in_channels（チャネル数）は config["model"]["in_channels"] を使用
     channels = config["model"]["in_channels"]
-
+    # モデルの image_size は config["model"]["input_size"] とする
+    image_size = config["model"]["input_size"]
+    
     # データセットと前処理の設定（config["dataset"] も参考に）
     if config["dataset"] in ["cifar"]:
         dataset_name = "cifar"
@@ -198,7 +202,7 @@ def main():
     ############################################
 
     # RF クラスの初期化（RFは model をラップするクラスとする）
-    rf = RF(model)  # RF クラスの実装に依存します
+    rf = RF(model, timesteps=timesteps)  # RF クラスの実装に依存します
     optimizer = optim.Adam(model.parameters(), lr=lr)
     #criterion = torch.nn.MSELoss()
 
@@ -239,7 +243,7 @@ def main():
             uncond = torch.ones_like(cond) * model_config["num_classes"]
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
-            images = rf.sample(init_noise, cond, uncond)
+            images = rf.sample(init_noise, cond, uncond, cfg)
 
             # 生成された画像列のうち、最終ステップの画像を使用
             final_image = images[-1]

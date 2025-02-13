@@ -169,13 +169,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # configに基づくデータセットと変換の設定
-    image_size = config["image_size"]
     batch_size = config["batch_size"]
     timesteps=config["timesteps"]
     cfg=config["cfg"]
 
-    # モデルの in_channels は config["model"]["in_channels"] とする
+    # モデルの channels は config["model"]["in_channels"] とする
     channels = config["model"]["in_channels"]
+    # モデルの image_size は config["model"]["input_size"] とする
+    image_size = config["model"]["input_size"]
 
     if config["dataset"] in ["cifar"]:
         transform = T.Compose([
