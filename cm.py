@@ -13,10 +13,10 @@ class ConsistencyModel:
         Consistency Training (CT) の初期化
 
         Args:
-            model_e: エンコーダーネットワーク（学習対象：パラメータ更新される）
-            model_t: ターゲットネットワーク（EMAで更新するため直接勾配更新は行わない）
-            timesteps: サンプリングに用いるステップ数
-            ln: True の場合、標準正規分布サンプルにシグモイドを適用して [0,1] の範囲に収める
+            model_e: オンラインネットワーク（学習対象、f_θ）
+            model_t: ターゲットネットワーク（EMAで更新される, f_θ'）
+            timesteps: 離散化ステップ数 N（例: 20）
+            ln: True の場合、時刻サンプリングにシグモイドを適用して [0,1] に収める
         """
         self.model_e = model_e
         self.model_t = model_t
@@ -25,82 +25,85 @@ class ConsistencyModel:
 
     def forward(self, x, cond):
         """
-        学習時のフォワードパス（Consistency Training, Algorithm 3 CT）
+        CT損失の計算（Algorithm 3に基づく）
 
-        1. バッチサイズ b に対して、時刻 t をサンプリング（ln=Trueならシグモイド適用）
-        2. t の形状を入力 x と合わせるために展開し、ノイズ z1 を生成
-        3. 線形補間により x_t = (1-t)x + t * z1 を計算
-        4. エンコーダーネットワーク model_e に x_t, t, cond を与え、出力 y_pred を得る
-        5. ターゲットネットワーク model_t に、t=0（=純粋な x）を与え y_target を得る
-        6. Consistency Loss: L = MSE(y_pred, y_target) を計算し、返す
+        1. 0〜1の区間を timesteps 個に線形分割した時刻グリッドを作成。
+        2. ランダムに隣接する2つの時刻 t_n と t_{n+1} を選ぶ。
+        3. それぞれの時刻に対して、ノイズ z を用い
+           x_t = (1-t)*x + t*z という形でノイズ付与画像を生成。
+        4. オンラインネットワーク (model_e) は x_{t_{n+1}} と t_{n+1} から予測を行い、
+           ターゲットネットワーク (model_t) は x_{t_n} と t_n から予測を行う。
+        5. 2つの出力の平方誤差 (MSE) を損失とする。
 
         Returns:
-            loss: バッチ全体の平均損失
-            info: ログ用情報（ここでは None として返す）
+            loss: CT損失（スカラー）
+            info: ログ情報（ここでは None）
         """
         b = x.size(0)
-        # ① 時刻 t のサンプリング
-        if self.ln:
-            nt = torch.randn((b,)).to(x.device)
-            t = torch.sigmoid(nt)
-        else:
-            t = torch.rand((b,)).to(x.device)
-        # 入力画像 x の次元に合わせて t を拡張（例：[b, 1, 1, 1]）
-        t_expanded = t.view([b, *([1] * (len(x.shape) - 1))])
-        
-        # ② ノイズ z1 の生成と ③ 線形補間による x_t の計算
-        z1 = torch.randn_like(x)
-        x_t = (1 - t_expanded) * x + t_expanded * z1
+        device = x.device
 
-        # ④ エンコーダーネットワークの出力（時刻 t の入力）
-        y_pred = self.model_e(x_t, t, cond)
-        
-        # ⑤ ターゲットネットワークの出力（時刻 0 を入力）
-        t0 = torch.zeros_like(t)
-        y_target = self.model_t(x, t0, cond)
+        # 0〜1の時刻グリッドを生成
+        t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
+        # ランダムに隣接する2つの時刻のインデックスを選択（n in [0, timesteps-2]）
+        n = torch.randint(0, self.timesteps - 1, (1,)).item()
+        t_n = t_grid[n]       # 早い時刻
+        t_np1 = t_grid[n+1]   # 次の時刻
 
-        # ⑥ Consistency Loss の計算（各サンプルごとの MSE を画像全体の次元で平均）
-        ldata = ((z1 - x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
-        lconsis = ((y_pred - y_target) ** 2).mean(dim=list(range(1, len(x.shape))))
-        loss = ldata + lconsis
-        return loss.mean(), None
+        # バッチ用の時刻テンソルを作成
+        t_n_tensor = t_n * torch.ones(b, device=device)
+        t_np1_tensor = t_np1 * torch.ones(b, device=device)
+
+        # xの次元に合わせて時刻テンソルを拡張（例: [B, 1, 1, 1]）
+        t_n_expanded = t_n_tensor.view(b, *([1] * (x.dim()-1)))
+        t_np1_expanded = t_np1_tensor.view(b, *([1] * (x.dim()-1)))
+
+        # ノイズを生成して、各時刻の画像を作成
+        noise_n = torch.randn_like(x)
+        noise_np1 = torch.randn_like(x)
+        x_tn = (1 - t_n_expanded) * x + t_n_expanded * noise_n
+        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_np1
+
+        # オンラインネットワーク: t_{n+1} における出力
+        y_pred = self.model_e(x_tnp1, t_np1_tensor, cond)
+        # ターゲットネットワーク: t_n における出力
+        y_target = self.model_t(x_tn, t_n_tensor, cond)
+
+        # MSEを計算（バッチ以外の次元で平均した後、バッチ平均）
+        dims = tuple(range(1, y_pred.dim()))
+        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((noise_np1 - x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
+
+        return loss, None
 
     @torch.no_grad()
     def sample(self, z, cond, null_cond=None, cfg=2.0):
         """
-        サンプリング（推論）時の処理
+        推論時のサンプリング
 
-        1. 初期ノイズ z から開始
-        2. 指定した timesteps 回のループで、時刻 t を徐々に下げながら model_e を適用し出力を更新
-        3. オプションで Classifier-Free Guidance を適用（null_cond が与えられている場合）
-
-        Args:
-            z: 初期ノイズテンソル
-            cond: 条件入力
-            null_cond: Classifier-Free Guidance 用の条件（通常は None）
-            cfg: Guidance の強さ
+        初期ノイズ z から開始し、timesteps 回のループでオンラインネットワーク (model_e)
+        を適用して最終的な x0 の推定を行う。オプションで Classifier-Free Guidance を適用可能。
 
         Returns:
-            images: サンプリング過程で得られた画像のリスト
+            images: 各ステップの出力を含むリスト
         """
         b = z.size(0)
+        device = z.device
         dt = 1.0 / self.timesteps
-        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * (len(z.shape) - 1))])
+        dt = torch.tensor([dt] * b, device=device).view(b, *([1] * (z.dim()-1)))
         images = [z]
-        # timesteps を逆順（t=1 から t=0）にループ
-        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop', total=self.timesteps):
+        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
             t_val = i / self.timesteps
-            t_tensor = torch.tensor([t_val] * b).to(z.device)
-            # model_e により出力を得る
+            t_tensor = torch.tensor([t_val] * b, device=device)
+            # オンラインネットワークの出力を取得
             y = self.model_e(z, t_tensor, cond)
-            # Classifier-Free Guidance（null_cond が指定されている場合）
+            # Classifier-Free Guidance（null_condが指定されている場合）
             if null_cond is not None:
                 y_null = self.model_e(z, t_tensor, null_cond)
                 y = y_null + cfg * (y - y_null)
-            # 更新（Consistency Model では通常、出力が直接 x0 の予測となる）
+            # CTでは、出力が直接 x0 の推定とみなすので、z を更新
             z = y
             images.append(z)
         return images
+
 
 # ---------------------------------------------------------------------
 # 例：学習ループ内での使用例（EMA更新などは学習ループ側で実施）
