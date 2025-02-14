@@ -10,13 +10,13 @@ from tqdm import tqdm
 class ConsistencyModel:
     def __init__(self, model_e, model_t, timesteps, ln=True):
         """
-        Consistency Model の初期化
+        Consistency Training (CT) の初期化
 
         Args:
-            model_e: エンコーダーネットワーク（学習対象）
-            model_t: ターゲットネットワーク（アンカー、t=0 のときの出力）
+            model_e: エンコーダーネットワーク（学習対象：パラメータ更新される）
+            model_t: ターゲットネットワーク（EMAで更新するため直接勾配更新は行わない）
             timesteps: サンプリングに用いるステップ数
-            ln: 時刻サンプリングに対して標準正規分布ではなく、シグモイドを適用するか否か
+            ln: True の場合、標準正規分布サンプルにシグモイドを適用して [0,1] の範囲に収める
         """
         self.model_e = model_e
         self.model_t = model_t
@@ -25,76 +25,99 @@ class ConsistencyModel:
 
     def forward(self, x, cond):
         """
-        学習時のフォワードパス
-        ・ランダムな時刻 t をサンプル
-        ・z1 はノイズ、zt = (1-t) * x + t * z1 として中間状態を生成
-        ・model_e(zt, t, cond) から推定 x0 (xt_pred) を得る
-        ・model_t(x, 0, cond) をターゲットとして xs_pred を得る
-        ・L_consistency = MSE(xt_pred, xs_pred) と L_data = MSE(xt_pred, x) を計算し、両者の和を損失とする
+        学習時のフォワードパス（Consistency Training, Algorithm 3 CT）
+
+        1. バッチサイズ b に対して、時刻 t をサンプリング（ln=Trueならシグモイド適用）
+        2. t の形状を入力 x と合わせるために展開し、ノイズ z1 を生成
+        3. 線形補間により x_t = (1-t)x + t * z1 を計算
+        4. エンコーダーネットワーク model_e に x_t, t, cond を与え、出力 y_pred を得る
+        5. ターゲットネットワーク model_t に、t=0（=純粋な x）を与え y_target を得る
+        6. Consistency Loss: L = MSE(y_pred, y_target) を計算し、返す
+
+        Returns:
+            loss: バッチ全体の平均損失
+            info: ログ用情報（ここでは None として返す）
         """
         b = x.size(0)
-        # 時刻 t のサンプル（ln=True の場合、正規分布にシグモイドを適用）
+        # ① 時刻 t のサンプリング
         if self.ln:
             nt = torch.randn((b,)).to(x.device)
             t = torch.sigmoid(nt)
         else:
             t = torch.rand((b,)).to(x.device)
-        # バッチサイズに合わせた形状に拡張
-        texp = t.view([b, *([1] * (len(x.shape) - 1))])
-        # 入力 x に対してノイズ z1 を生成し、中間状態 z_t を計算
+        # 入力画像 x の次元に合わせて t を拡張（例：[b, 1, 1, 1]）
+        t_expanded = t.view([b, *([1] * (len(x.shape) - 1))])
+        
+        # ② ノイズ z1 の生成と ③ 線形補間による x_t の計算
         z1 = torch.randn_like(x)
-        zt = (1 - texp) * x + texp * z1
+        x_t = (1 - t_expanded) * x + t_expanded * z1
 
-        # エンコーダーネットワークによる推定 (f_theta(x_t, t))
-        xt_pred = self.model_e(zt, t, cond)
-        # ターゲットネットワーク: t=0 を与えて、アンカーとしての x0 を取得
+        # ④ エンコーダーネットワークの出力（時刻 t の入力）
+        y_pred = self.model_e(x_t, t, cond)
+        
+        # ⑤ ターゲットネットワークの出力（時刻 0 を入力）
         t0 = torch.zeros_like(t)
-        xs_pred = self.model_t(x, t0, cond)
+        y_target = self.model_t(x, t0, cond)
 
-        # 一貫性損失: model_e の出力同士が近くなるように
-        L_consistency = ((xt_pred - xs_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
-        # データ損失: 推定結果が元の x に近づくように
-        L_data = ((z1 - x - xt_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
-        loss = L_consistency + L_data
-
-        # （ログ用）各サンプルごとの t と一貫性損失をリスト化
-        t_list = t.detach().cpu().reshape(-1).tolist()
-        loss_list = L_consistency.detach().cpu().reshape(-1).tolist()
-        ttloss = [(tv, tloss) for tv, tloss in zip(t_list, loss_list)]
-
-        return loss.mean(), ttloss
+        # ⑥ Consistency Loss の計算（各サンプルごとの MSE を画像全体の次元で平均）
+        ldata = ((z1 - x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
+        lconsis = ((y_pred - y_target) ** 2).mean(dim=list(range(1, len(x.shape))))
+        loss = ldata + lconsis
+        return loss.mean(), None
 
     @torch.no_grad()
     def sample(self, z, cond, null_cond=None, cfg=2.0):
         """
         サンプリング（推論）時の処理
-        ・初期ノイズ z から開始
-        ・timesteps 回の反復処理で、各ステップで時刻 t を与えて model_e により直接 x0 の推定を行う
-        ・(オプション) Classifier-Free Guidance を用いて、null_cond を使った補正を行う
+
+        1. 初期ノイズ z から開始
+        2. 指定した timesteps 回のループで、時刻 t を徐々に下げながら model_e を適用し出力を更新
+        3. オプションで Classifier-Free Guidance を適用（null_cond が与えられている場合）
+
+        Args:
+            z: 初期ノイズテンソル
+            cond: 条件入力
+            null_cond: Classifier-Free Guidance 用の条件（通常は None）
+            cfg: Guidance の強さ
 
         Returns:
-            生成途中の画像リスト images
+            images: サンプリング過程で得られた画像のリスト
         """
         b = z.size(0)
         dt = 1.0 / self.timesteps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * (len(z.shape) - 1))])
         images = [z]
-        # 逆順（t=1 から t=0）に timesteps 分ループ
-        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
+        # timesteps を逆順（t=1 から t=0）にループ
+        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop', total=self.timesteps):
             t_val = i / self.timesteps
             t_tensor = torch.tensor([t_val] * b).to(z.device)
-            # 現在の z に対して model_e を適用し、x0 の推定を得る
-            x_pred = self.model_e(z, t_tensor, cond)
-            # Classifier-Free Guidance の場合
+            # model_e により出力を得る
+            y = self.model_e(z, t_tensor, cond)
+            # Classifier-Free Guidance（null_cond が指定されている場合）
             if null_cond is not None:
-                x_pred_null = self.model_e(z, t_tensor, null_cond)
-                x_pred = x_pred_null + cfg * (x_pred - x_pred_null)
-            # Consistency Model では、単一または少数ステップで直接 x0 を得るため z を更新
-            z = x_pred
+                y_null = self.model_e(z, t_tensor, null_cond)
+                y = y_null + cfg * (y - y_null)
+            # 更新（Consistency Model では通常、出力が直接 x0 の予測となる）
+            z = y
             images.append(z)
         return images
 
+# ---------------------------------------------------------------------
+# 例：学習ループ内での使用例（EMA更新などは学習ループ側で実施）
+# ---------------------------------------------------------------------
 
+def update_target_network(model_e, model_t, decay):
+    """
+    model_t のパラメータを、model_e のパラメータのEMAで更新する
+
+    Args:
+        model_e: エンコーダーネットワーク（最新パラメータ）
+        model_t: ターゲットネットワーク（EMA更新対象）
+        decay: EMAの減衰係数（例: 0.999）
+    """
+    with torch.no_grad():
+        for param_t, param_e in zip(model_t.parameters(), model_e.parameters()):
+            param_t.data.mul_(decay).add_(param_e.data, alpha=1 - decay)
 
 # -------------------------------
 # Main function: 設定ファイルの読み込みと学習処理
@@ -248,6 +271,7 @@ def main():
     training_config = config["training"]
     epochs = training_config["epochs"]
     lr = training_config["learning_rate"]
+    ema_decay=0.999
 
     # 出力先ディレクトリの作成（config の output_dir などを利用）
     output_dir = "outputs"
@@ -293,6 +317,8 @@ def main():
             loss, blsct = cm.forward(x, c)
             loss.backward()
             optimizer.step()
+            # EMAによるターゲットネットワークの更新
+            update_target_network(model_e, model_t, ema_decay)
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
