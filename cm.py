@@ -70,7 +70,7 @@ class ConsistencyModel:
 
         # MSEを計算（バッチ以外の次元で平均した後、バッチ平均）
         dims = tuple(range(1, y_pred.dim()))
-        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((noise_np1 - x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
+        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
 
         return loss, None
 
