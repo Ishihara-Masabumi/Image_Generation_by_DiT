@@ -2,52 +2,99 @@
 import argparse
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
 
-class RF:
-    def __init__(self, model, timesteps, ln=True):
-        self.model = model
-        self.ln = ln
+class ConsistencyModel:
+    def __init__(self, model_e, model_t, timesteps, ln=True):
+        """
+        Consistency Model の初期化
+
+        Args:
+            model_e: エンコーダーネットワーク（学習対象）
+            model_t: ターゲットネットワーク（アンカー、t=0 のときの出力）
+            timesteps: サンプリングに用いるステップ数
+            ln: 時刻サンプリングに対して標準正規分布ではなく、シグモイドを適用するか否か
+        """
+        self.model_e = model_e
+        self.model_t = model_t
         self.timesteps = timesteps
+        self.ln = ln
 
     def forward(self, x, cond):
+        """
+        学習時のフォワードパス
+        ・ランダムな時刻 t をサンプル
+        ・z1 はノイズ、zt = (1-t) * x + t * z1 として中間状態を生成
+        ・model_e(zt, t, cond) から推定 x0 (xt_pred) を得る
+        ・model_t(x, 0, cond) をターゲットとして xs_pred を得る
+        ・L_consistency = MSE(xt_pred, xs_pred) と L_data = MSE(xt_pred, x) を計算し、両者の和を損失とする
+        """
         b = x.size(0)
+        # 時刻 t のサンプル（ln=True の場合、正規分布にシグモイドを適用）
         if self.ln:
             nt = torch.randn((b,)).to(x.device)
             t = torch.sigmoid(nt)
         else:
             t = torch.rand((b,)).to(x.device)
-        texp = t.view([b, *([1] * len(x.shape[1:]))])
+        # バッチサイズに合わせた形状に拡張
+        texp = t.view([b, *([1] * (len(x.shape) - 1))])
+        # 入力 x に対してノイズ z1 を生成し、中間状態 z_t を計算
         z1 = torch.randn_like(x)
         zt = (1 - texp) * x + texp * z1
-        vtheta = self.model(zt, t, cond)
-        batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
-        tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
-        ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
-        return batchwise_mse.mean(), ttloss
+
+        # エンコーダーネットワークによる推定 (f_theta(x_t, t))
+        xt_pred = self.model_e(zt, t, cond)
+        # ターゲットネットワーク: t=0 を与えて、アンカーとしての x0 を取得
+        t0 = torch.zeros_like(t)
+        xs_pred = self.model_t(x, t0, cond)
+
+        # 一貫性損失: model_e の出力同士が近くなるように
+        L_consistency = ((xt_pred - xs_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
+        # データ損失: 推定結果が元の x に近づくように
+        L_data = ((z1 - x - xt_pred) ** 2).mean(dim=list(range(1, len(x.shape))))
+        loss = L_consistency + L_data
+
+        # （ログ用）各サンプルごとの t と一貫性損失をリスト化
+        t_list = t.detach().cpu().reshape(-1).tolist()
+        loss_list = L_consistency.detach().cpu().reshape(-1).tolist()
+        ttloss = [(tv, tloss) for tv, tloss in zip(t_list, loss_list)]
+
+        return loss.mean(), ttloss
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond, cfg=2.0):
+    def sample(self, z, cond, null_cond=None, cfg=2.0):
+        """
+        サンプリング（推論）時の処理
+        ・初期ノイズ z から開始
+        ・timesteps 回の反復処理で、各ステップで時刻 t を与えて model_e により直接 x0 の推定を行う
+        ・(オプション) Classifier-Free Guidance を用いて、null_cond を使った補正を行う
+
+        Returns:
+            生成途中の画像リスト images
+        """
         b = z.size(0)
         dt = 1.0 / self.timesteps
-        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
+        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * (len(z.shape) - 1))])
         images = [z]
+        # 逆順（t=1 から t=0）に timesteps 分ループ
         for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
-            t = i / self.timesteps
-            t = torch.tensor([t] * b).to(z.device)
-
-            vc = self.model(z, t, cond)
-
-            # Classifier Free Guidance
+            t_val = i / self.timesteps
+            t_tensor = torch.tensor([t_val] * b).to(z.device)
+            # 現在の z に対して model_e を適用し、x0 の推定を得る
+            x_pred = self.model_e(z, t_tensor, cond)
+            # Classifier-Free Guidance の場合
             if null_cond is not None:
-                vu = self.model(z, t, null_cond)
-                vc = vu + cfg * (vc - vu)
-
-            z = z - dt * vc
+                x_pred_null = self.model_e(z, t_tensor, null_cond)
+                x_pred = x_pred_null + cfg * (x_pred - x_pred_null)
+            # Consistency Model では、単一または少数ステップで直接 x0 を得るため z を更新
+            z = x_pred
             images.append(z)
         return images
+
+
 
 # -------------------------------
 # Main function: 設定ファイルの読み込みと学習処理
@@ -168,7 +215,22 @@ def main():
 
     # モデルの構成：config["model"] 内のパラメータを使用して DiT_Llama を初期化
     model_config = config["model"]
-    model = DiT_Llama(
+
+    model_e = DiT_Llama(
+        in_channels=model_config["in_channels"],
+        input_size=model_config["input_size"],
+        patch_size=model_config["patch_size"],
+        dim=model_config["dim"],
+        n_layers=model_config["n_layers"],
+        n_heads=model_config["n_heads"],
+        multiple_of=model_config["multiple_of"],
+        ffn_dim_multiplier=model_config["ffn_dim_multiplier"],
+        norm_eps=model_config["norm_eps"],
+        class_dropout_prob=model_config["class_dropout_prob"],
+        num_classes=model_config["num_classes"] + 1
+    ).to(device)
+
+    model_t = DiT_Llama(
         in_channels=model_config["in_channels"],
         input_size=model_config["input_size"],
         patch_size=model_config["patch_size"],
@@ -196,19 +258,19 @@ def main():
     # モデルへの入力まで、DDPMコードと同一の処理です。
 
     ############################################
-    # 以下、Rectified Flow (RF) の学習処理部分に修正
+    # ConsistencyModel (CM) の学習処理部分に修正
     ############################################
 
-    # RF クラスの初期化（RFは model をラップするクラスとする）
-    rf = RF(model, timesteps=timesteps)  # RF クラスの実装に依存します
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # ConsistencyModel クラスの初期化（cmは model をラップするクラスとする）
+    cm = ConsistencyModel(model_e, model_t, timesteps=timesteps)  # cm クラスの実装に依存します
+    optimizer = optim.Adam(model_e.parameters(), lr=lr)
     #criterion = torch.nn.MSELoss()
 
     # 学習ループ
     for epoch in range(1, epochs + 1):
         losses = []
         bar = tqdm(dataloader, desc=f"Epoch {epoch}", total=len(dataloader))
-        model.train()
+        cm.model_e.train()
 
         for batch in bar: # この行を変更
 
@@ -228,20 +290,20 @@ def main():
                     c = c.to(device)
 
             optimizer.zero_grad()
-            loss, blsct = rf.forward(x, c)
+            loss, blsct = cm.forward(x, c)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
         # サンプル生成
-        rf.model.eval()
+        cm.model_e.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % model_config["num_classes"]
             uncond = torch.ones_like(cond) * model_config["num_classes"]
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
-            images = rf.sample(init_noise, cond, uncond, cfg)
+            images = cm.sample(init_noise, cond, uncond, cfg)
 
             # 生成された画像列のうち、最終ステップの画像を使用
             final_image = images[-1]
@@ -253,7 +315,7 @@ def main():
             # 画像を保存
             save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
 
-        rf.model.train()
+        cm.model_e.train()
 
     print("Training complete.")
 

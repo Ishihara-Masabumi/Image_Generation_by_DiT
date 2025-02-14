@@ -6,49 +6,88 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-class RF:
-    def __init__(self, model, timesteps, ln=True):
+class OTFlow:
+    def __init__(self, model, timesteps, sigma_min=0.0):
+        """
+        model: 条件付き速度場を予測するニューラルネットワーク
+        timesteps: サンプリングに用いるステップ数
+        sigma_min: OT条件付きVFにおける最小分散パラメータ（例: 0.0なら標準設定）
+        """
         self.model = model
-        self.ln = ln
         self.timesteps = timesteps
+        self.sigma_min = sigma_min
 
     def forward(self, x, cond):
+        """
+        学習時の処理：
+         x: ソースサンプル (X0)
+         cond: ターゲットサンプル (X1)（条件として利用）
+         
+        OT 条件付き経路は、以下のように定義されます：
+          ψ_t(x) = (1 - (1 - σ_min) t)x + t * cond.
+        対応するターゲット速度場は、
+          u_t(x|cond) = (cond - (1 - σ_min)x) / (1 - (1 - σ_min)t)
+        となります。
+        """
+        # xとcondの空間サイズを揃える
+        if x.shape[2:] != cond.shape[2:]:
+            cond = F.interpolate(cond, size=x.shape[2:], mode='bilinear', align_corners=False)
+
         b = x.size(0)
-        if self.ln:
-            nt = torch.randn((b,)).to(x.device)
-            t = torch.sigmoid(nt)
-        else:
-            t = torch.rand((b,)).to(x.device)
-        texp = t.view([b, *([1] * len(x.shape[1:]))])
+        # 一様分布から t をサンプリング
+        t = torch.rand((b,)).to(x.device)
+        # xの形状に合わせて t を拡張（例: [B,1,1,1]）
+        texp = t.view([b] + [1] * (len(x.shape) - 1))
+        # x と同じ形状のノイズ z1 を生成
         z1 = torch.randn_like(x)
-        zt = (1 - texp) * x + texp * z1
+        # OT条件付き確率経路 ψ_t(x) の計算:
+        zt = (1 - (1 - self.sigma_min) * texp) * x + texp * cond
+        # モデルから予測される速度 vθ を取得
         vtheta = self.model(zt, t, cond)
-        batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
+        # ターゲット速度 v_true の計算:
+        # u_t(x|cond) = (cond - (1 - σ_min) * x) / (1 - (1 - σ_min)*t)
+        denom = 1 - (1 - self.sigma_min) * texp
+        v_true = (cond - (1 - self.sigma_min) * x) / denom
+
+        # MSE 損失を計算（バッチ内の他の次元で平均）
+        batchwise_mse = ((v_true - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
         tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
         ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
         return batchwise_mse.mean(), ttloss
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond, cfg=2.0):
+    def sample(self, z, cond, null_cond=None, cfg=2.0):
+        """
+        サンプリング時の処理：
+         z: 初期サンプル (通常は完全なノイズ)
+         cond: ターゲットサンプル (条件)
+         null_cond: Classifier-Free Guidance用の非条件付き入力（オプション）
+         cfg: ガイダンス係数
+         
+        Euler法により、OT条件付き速度場に従った ODE を解いてサンプルを生成します。
+        """
+        # zとcondの空間サイズを揃える
+        if z.shape[2:] != cond.shape[2:]:
+            cond = F.interpolate(cond, size=z.shape[2:], mode='bilinear', align_corners=False)
+
         b = z.size(0)
         dt = 1.0 / self.timesteps
-        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
+        dt = torch.tensor([dt] * b).to(z.device).view(b, *([1] * (len(z.shape) - 1)))
         images = [z]
         for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
-            t = i / self.timesteps
-            t = torch.tensor([t] * b).to(z.device)
-
-            vc = self.model(z, t, cond)
-
-            # Classifier Free Guidance
+            t_val = i / self.timesteps
+            t_tensor = torch.tensor([t_val] * b).to(z.device)
+            # モデルから速度を取得
+            vc = self.model(z, t_tensor, cond)
+            # Classifier-Free Guidanceの適用（オプション）
             if null_cond is not None:
-                vu = self.model(z, t, null_cond)
+                vu = self.model(z, t_tensor, null_cond)
                 vc = vu + cfg * (vc - vu)
-
+            # Euler法による更新
             z = z - dt * vc
             images.append(z)
         return images
-
+    
 # -------------------------------
 # Main function: 設定ファイルの読み込みと学習処理
 # -------------------------------
@@ -72,9 +111,9 @@ from dit import DiT_Llama
 
 
 def main():
-    #import sys
+    import sys
+    sys.argv = ['script.py', '--dataset', 'cifar']
 
-    #sys.argv = ['script.py', '--dataset', 'cifar']
     # コマンドライン引数でデータセットを選択
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
     parser.add_argument("--dataset", type=str, default="mnist",
@@ -200,7 +239,7 @@ def main():
     ############################################
 
     # RF クラスの初期化（RFは model をラップするクラスとする）
-    rf = RF(model, timesteps=timesteps)  # RF クラスの実装に依存します
+    of = OTFlow(model, timesteps=timesteps)  # RF クラスの実装に依存します
     optimizer = optim.Adam(model.parameters(), lr=lr)
     #criterion = torch.nn.MSELoss()
 
@@ -228,20 +267,20 @@ def main():
                     c = c.to(device)
 
             optimizer.zero_grad()
-            loss, blsct = rf.forward(x, c)
+            loss, blsct = of.forward(x, c)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
         # サンプル生成
-        rf.model.eval()
+        of.model.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % model_config["num_classes"]
             uncond = torch.ones_like(cond) * model_config["num_classes"]
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
-            images = rf.sample(init_noise, cond, uncond, cfg)
+            images = of.sample(init_noise, cond, uncond, cfg)
 
             # 生成された画像列のうち、最終ステップの画像を使用
             final_image = images[-1]
@@ -253,7 +292,7 @@ def main():
             # 画像を保存
             save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
 
-        rf.model.train()
+        of.model.train()
 
     print("Training complete.")
 

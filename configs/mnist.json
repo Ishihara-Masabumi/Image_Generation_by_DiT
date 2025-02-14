@@ -1,7 +1,7 @@
 {
   "dataset": "mnist",
   "batch_size": 128,
-  "timesteps": 50,
+  "timesteps": 1,
   "cfg": 2.0,
   "model": {
     "in_channels": 1,

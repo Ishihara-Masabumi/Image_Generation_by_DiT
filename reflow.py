@@ -100,8 +100,8 @@ from dit import DiT_Llama
 
 
 def main():
-    import sys
-    sys.argv = ['script.py', '--dataset', 'cifar']
+    #import sys
+    #sys.argv = ['script.py', '--dataset', 'cifar']
 
     # コマンドライン引数でデータセットを選択
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")

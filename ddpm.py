@@ -1,20 +1,22 @@
-from dit import DiT_Llama
 import argparse
 import json
 import math
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-
-from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader
-from torchvision.utils import make_grid, save_image
-from torchvision import transforms as T, datasets
+from pathlib import Path
 
 import numpy as np
-from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from torchvision import transforms as T
+from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
+
+from dit import DiT_Llama
+
 
 ########################################
 # DDPM クラス（元の処理内容と同一）
@@ -143,7 +145,7 @@ class DDPM:
 # メイン処理：configファイルからパラメータを読み込み、各データセットを切り替え
 ########################################
 def main():
-    import sys
+    #import sys
     #sys.argv = ['script.py', '--dataset', 'huggan']
 
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
@@ -198,6 +200,7 @@ def main():
     elif config["dataset"] in ["huggan/AFHQv2", "huggan"]:
         from datasets import load_dataset
         from torchvision import transforms
+
         # データセットのロード
         fdataset = load_dataset("huggan/afhqv2")
         dataset = fdataset["train"]
