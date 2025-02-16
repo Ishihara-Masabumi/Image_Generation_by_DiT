@@ -1,6 +1,6 @@
 {
   "dataset": "mnist",
-  "batch_size": 128,
+  "batch_size": 32,
   "timesteps": 100,
   "cfg": 2.0,
   "model": {
