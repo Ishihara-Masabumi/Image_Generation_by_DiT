@@ -60,8 +60,8 @@ class ConsistencyModel:
         # ノイズを生成して、各時刻の画像を作成
         noise_n = torch.randn_like(x)
         #noise_np1 = torch.randn_like(x)
-        x_tn = (1 - t_n_expanded) * x + t_n_expanded * noise_n
-        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_n
+        x_tn = (1 - t_n_expanded) * noise_n + t_n_expanded * x
+        x_tnp1 = (1 - t_np1_expanded) * noise_n + t_np1_expanded * x
 
         # オンラインネットワーク: t_{n+1} における出力
         y_pred = self.model_e(x_tnp1, t_np1_tensor, cond)
@@ -279,7 +279,7 @@ def main():
     training_config = config["training"]
     epochs = training_config["epochs"]
     lr = training_config["learning_rate"]
-    ema_decay=0.995
+    ema_decay=0.999
 
     # 出力先ディレクトリの作成（config の output_dir などを利用）
     output_dir = "outputs"

@@ -1,7 +1,7 @@
 {
     "dataset": "cifar",
-    "batch_size": 64,
-    "timesteps": 300,
+    "batch_size": 32,
+    "timesteps": 100,
     "cfg": 2.0,
     "model": {
         "in_channels": 3,
@@ -12,12 +12,12 @@
         "n_heads": 8,
         "multiple_of": 256,
         "ffn_dim_multiplier": null,
-        "norm_eps": 1e-5,
+        "norm_eps": 5e-4,
         "class_dropout_prob": 0.0,
         "num_classes": 10
     },
     "training": {
-        "epochs": 100,
+        "epochs": 300,
         "learning_rate": 1e-4
     }
 }
