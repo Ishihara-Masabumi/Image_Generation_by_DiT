@@ -74,7 +74,7 @@ class ConsistencyModel:
         # 2つの出力間のMSE損失と再構成誤差の計算
         dims = tuple(range(1, y_pred.dim()))
         loss_pred = ((y_pred - y_target) ** 2).mean(dim=dims).mean()
-        loss_recon = ((x - y_pred) ** 2).mean(dim=list(range(1, x.dim()))).mean() * 0.5
+        loss_recon = ((x - y_pred) ** 2).mean(dim=list(range(1, x.dim()))).mean() * 0.75
         loss = loss_pred + loss_recon
         return loss, None
 
@@ -279,7 +279,7 @@ def main():
     training_config = config["training"]
     epochs = training_config["epochs"]
     lr = training_config["learning_rate"]
-    ema_decay=0.99
+    ema_decay=0.995
 
     # 出力先ディレクトリの作成（config の output_dir などを利用）
     output_dir = "outputs"
