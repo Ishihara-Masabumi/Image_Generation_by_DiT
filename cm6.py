@@ -59,9 +59,9 @@ class ConsistencyModel:
 
         # ノイズを生成して、各時刻の画像を作成
         noise_n = torch.randn_like(x)
-        noise_np1 = torch.randn_like(x)
+        #noise_np1 = torch.randn_like(x)
         x_tn = (1 - t_n_expanded) * x + t_n_expanded * noise_n
-        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_np1
+        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_n
 
         # オンラインネットワーク: t_{n+1} における出力
         y_pred = self.model_e(x_tnp1, t_np1_tensor, cond)
@@ -69,9 +69,13 @@ class ConsistencyModel:
         y_target = self.model_t(x_tn, t_n_tensor, cond)
 
         # MSEを計算（バッチ以外の次元で平均した後、バッチ平均）
+        #dims = tuple(range(1, y_pred.dim()))
+        #loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
+        # 2つの出力間のMSE損失と再構成誤差の計算
         dims = tuple(range(1, y_pred.dim()))
-        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
-
+        loss_pred = ((y_pred - y_target) ** 2).mean(dim=dims).mean()
+        loss_recon = ((x - y_pred) ** 2).mean(dim=list(range(1, x.dim()))).mean() * 0.5
+        loss = loss_pred + loss_recon
         return loss, None
 
     @torch.no_grad()
@@ -146,8 +150,8 @@ from dit import DiT_Llama
 
 
 def main():
-    import sys
-    sys.argv = ['script.py', '--dataset', 'cifar']
+    #import sys
+    #sys.argv = ['script.py', '--dataset', 'cifar']
     
     # コマンドライン引数でデータセットを選択
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
@@ -275,7 +279,7 @@ def main():
     training_config = config["training"]
     epochs = training_config["epochs"]
     lr = training_config["learning_rate"]
-    ema_decay=0.999
+    ema_decay=0.99
 
     # 出力先ディレクトリの作成（config の output_dir などを利用）
     output_dir = "outputs"

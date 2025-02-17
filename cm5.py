@@ -7,17 +7,18 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-class ConsistencyModel:
+class ConsistencyTrainingModel(nn.Module):
     def __init__(self, model_e, model_t, timesteps, ln=True):
         """
         Consistency Training (CT) の初期化
 
         Args:
-            model_e: オンラインネットワーク（学習対象、f_θ）
-            model_t: ターゲットネットワーク（EMAで更新される, f_θ'）
-            timesteps: 離散化ステップ数 N（例: 20）
-            ln: True の場合、時刻サンプリングにシグモイドを適用して [0,1] に収める
+            model_e: オンラインネットワーク (f_θ)
+            model_t: ターゲットネットワーク (f_θ')
+            timesteps: 時刻グリッドの分割数（例: 20）
+            use_sigmoid: Trueの場合、時刻サンプリングにシグモイドを適用する（オプション）
         """
+        super().__init__()
         self.model_e = model_e
         self.model_t = model_t
         self.timesteps = timesteps
@@ -25,19 +26,17 @@ class ConsistencyModel:
 
     def forward(self, x, cond):
         """
-        CT損失の計算（Algorithm 3に基づく）
+        Consistency Trainingの損失を計算する
 
-        1. 0〜1の区間を timesteps 個に線形分割した時刻グリッドを作成。
-        2. ランダムに隣接する2つの時刻 t_n と t_{n+1} を選ぶ。
-        3. それぞれの時刻に対して、ノイズ z を用い
-           x_t = (1-t)*x + t*z という形でノイズ付与画像を生成。
-        4. オンラインネットワーク (model_e) は x_{t_{n+1}} と t_{n+1} から予測を行い、
-           ターゲットネットワーク (model_t) は x_{t_n} と t_n から予測を行う。
-        5. 2つの出力の平方誤差 (MSE) を損失とする。
+        1. 0〜1の範囲をtimesteps個に分割した時刻グリッドを作成
+        2. 隣接する2つの時刻 t_n と t_{n+1} をランダムに選択
+        3. 同一のノイズ z を用いて
+           x_t = (1-t)*x + t*z　という形でノイズ付与画像を生成
+        4. オンラインネットワークは x_{t_{n+1}}、ターゲットネットワークは x_{t_n} を入力して出力を予測
+        5. 2つの出力の差のMSEと、xとオンラインネットワークの出力の再構成誤差の和を損失とする
 
         Returns:
             loss: CT損失（スカラー）
-            info: ログ情報（ここでは None）
         """
         b = x.size(0)
         device = x.device
@@ -59,69 +58,67 @@ class ConsistencyModel:
 
         # ノイズを生成して、各時刻の画像を作成
         noise_n = torch.randn_like(x)
-        noise_np1 = torch.randn_like(x)
+        #noise_np1 = torch.randn_like(x)
         x_tn = (1 - t_n_expanded) * x + t_n_expanded * noise_n
-        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_np1
+        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_n
 
-        # オンラインネットワーク: t_{n+1} における出力
+        # オンラインネットワークとターゲットネットワークの出力を取得
         y_pred = self.model_e(x_tnp1, t_np1_tensor, cond)
-        # ターゲットネットワーク: t_n における出力
         y_target = self.model_t(x_tn, t_n_tensor, cond)
 
-        # MSEを計算（バッチ以外の次元で平均した後、バッチ平均）
+        # 2つの出力間のMSE損失と再構成誤差の計算
         dims = tuple(range(1, y_pred.dim()))
-        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
+        loss_pred = ((y_pred - y_target) ** 2).mean(dim=dims).mean()
+        loss_recon = ((x - y_pred) ** 2).mean(dim=list(range(1, x.dim()))).mean()
+        loss = loss_pred + loss_recon
 
-        return loss, None
+        return loss
 
     @torch.no_grad()
-    def sample(self, z, cond, null_cond=None, cfg=2.0):
+    def sample(self, z, cond, null_cond=None, cfg=2.0, sample_steps=10):
         """
-        推論時のサンプリング
+        サンプリング（推論）の実装
 
-        初期ノイズ z から開始し、timesteps 回のループでオンラインネットワーク (model_e)
-        を適用して最終的な x0 の推定を行う。オプションで Classifier-Free Guidance を適用可能。
+        初期ノイズ z から開始し、sample_steps回のループでオンラインネットワークを適用して x0 を推定する。
+        オプションで、Classifier-Free Guidanceも適用可能。
 
         Returns:
-            images: 各ステップの出力を含むリスト
+            images: 各ステップの出力を格納したリスト
         """
-        sample_timesteps = 10
         b = z.size(0)
         device = z.device
-        dt = 1.0 / sample_timesteps
-        dt = torch.tensor([dt] * b, device=device).view(b, *([1] * (z.dim()-1)))
+        dt = 1.0 / sample_steps
+        dt_tensor = torch.tensor([dt] * b, device=device).view(b, *([1]*(z.dim()-1)))
         images = [z]
-        for i in tqdm(reversed(range(sample_timesteps + 1)), desc='sampling loop time step', total=(sample_timesteps + 1)):
-            t_val = i / sample_timesteps
-            t_tensor = torch.tensor([t_val] * b, device=device)
-            # オンラインネットワークの出力を取得
+        for i in reversed(range(sample_steps + 1)):
+            t_val = i / sample_steps
+            t_tensor = torch.full((b,), t_val, device=device)
+            # オンラインネットワークから出力を取得
             y = self.model_e(z, t_tensor, cond)
-            # Classifier-Free Guidance（null_condが指定されている場合）
+            # Classifier-Free Guidanceの適用
             if null_cond is not None:
                 y_null = self.model_e(z, t_tensor, null_cond)
                 y = y_null + cfg * (y - y_null)
-            # CTでは、出力が直接 x0 の推定とみなすので、z を更新
             z = y
             images.append(z)
         return images
 
-
-# ---------------------------------------------------------------------
-# 例：学習ループ内での使用例（EMA更新などは学習ループ側で実施）
-# ---------------------------------------------------------------------
-
+# -----------------------------------------------
+# EMAによるターゲットネットワークの更新関数
+# -----------------------------------------------
 def update_target_network(model_e, model_t, decay):
     """
-    model_t のパラメータを、model_e のパラメータのEMAで更新する
+    ターゲットネットワーク (model_t) のパラメータをオンラインネットワーク (model_e) のパラメータのEMAで更新する。
 
     Args:
-        model_e: エンコーダーネットワーク（最新パラメータ）
-        model_t: ターゲットネットワーク（EMA更新対象）
+        model_e: オンラインネットワーク
+        model_t: ターゲットネットワーク
         decay: EMAの減衰係数（例: 0.999）
     """
     with torch.no_grad():
         for param_t, param_e in zip(model_t.parameters(), model_e.parameters()):
             param_t.data.mul_(decay).add_(param_e.data, alpha=1 - decay)
+
 
 # -------------------------------
 # Main function: 設定ファイルの読み込みと学習処理
@@ -146,9 +143,9 @@ from dit import DiT_Llama
 
 
 def main():
-    import sys
-    sys.argv = ['script.py', '--dataset', 'cifar']
-    
+    #import sys
+    #sys.argv = ['script.py', '--dataset', 'cifar']
+
     # コマンドライン引数でデータセットを選択
     parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
     parser.add_argument("--dataset", type=str, default="mnist",
@@ -290,7 +287,7 @@ def main():
     ############################################
 
     # ConsistencyModel クラスの初期化（cmは model をラップするクラスとする）
-    cm = ConsistencyModel(model_e, model_t, timesteps=timesteps)  # cm クラスの実装に依存します
+    cm = ConsistencyTrainingModel(model_e, model_t, timesteps=timesteps)  # cm クラスの実装に依存します
     optimizer = optim.Adam(model_e.parameters(), lr=lr)
     #criterion = torch.nn.MSELoss()
 
