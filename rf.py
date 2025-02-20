@@ -253,7 +253,8 @@ def main():
             # 画像を保存
             save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
 
-        rf.model.train()
+        # 学習したモデルの保存
+        torch.save(model.state_dict(), img_dir / "rectified_flow.pth")
 
     print("Training complete.")
 

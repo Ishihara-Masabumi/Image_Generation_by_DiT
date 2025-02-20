@@ -303,6 +303,9 @@ def main():
             samples = (samples + 1) / 2  # [-1, 1] -> [0, 1]
             grid = make_grid(samples, nrow=4)
             save_image(grid, img_dir / f"sample_{epoch}.png")
+        
+        # 学習したモデルの保存
+        torch.save(model.state_dict(), img_dir / "ddmp.pth")
 
     print("Training complete.")
 
