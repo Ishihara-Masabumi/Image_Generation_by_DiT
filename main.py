@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -129,6 +131,7 @@ class ConsistencyModel:
 
 
 def main():
+    import os
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # モデルの初期化
@@ -150,6 +153,9 @@ def main():
     # オプティマイザを学習率を下げて定義
     optimizer = torch.optim.Adam(model_e.parameters(), lr=1e-4)
 
+    output_dir = "outputs_cifar10_ct_ema"
+    os.makedirs(output_dir, exist_ok=True)
+
     # 学習ループ
     epochs = 1000
     for epoch in range(1, epochs + 1):
@@ -165,7 +171,7 @@ def main():
                 
                 # 最初のバッチのみ Input Labels を表示
                 if first_batch:
-                    print(f"\n[Epoch {epoch}] Input labels (cond) shape: {y.shape}, values: {y[:5].tolist()}")
+                    #print(f"\n[Epoch {epoch}] Input labels (cond) shape: {y.shape}, values: {y[:5].tolist()}")
                     first_batch = False
                 
                 loss, _ = cm.forward(x, y)
@@ -189,7 +195,6 @@ def main():
         # 評価モードに設定
         model_e.eval()
         model_t.eval()
-
 
         # モデルの保存
         torch.save(model_e.state_dict(), f"outputs_cifar10_ct_ema/model_e_epoch_{epoch}.pth")
