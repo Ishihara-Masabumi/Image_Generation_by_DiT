@@ -8,6 +8,7 @@ import torch.nn.functional as F
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
@@ -39,6 +40,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
 class LabelEmbedder(nn.Module):
     def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
@@ -66,10 +68,10 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+
 class Attention(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
-
         self.n_heads = n_heads
         self.n_rep = 1
         self.head_dim = dim // n_heads
@@ -103,11 +105,9 @@ class Attention(nn.Module):
 
     def forward(self, x, freqs_cis):
         bsz, seqlen, _ = x.shape
-
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         dtype = xq.dtype
-
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
 
@@ -129,6 +129,7 @@ class Attention(nn.Module):
 
         return self.wo(output)
 
+
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier=None):
         super().__init__()
@@ -146,6 +147,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+
 
 class TransformerBlock(nn.Module):
     def __init__(
@@ -193,6 +195,7 @@ class TransformerBlock(nn.Module):
 
         return x
 
+
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -204,16 +207,16 @@ class FinalLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(min(hidden_size, 1024), 2 * hidden_size, bias=True),
         )
-        # # init zero
-        nn.init.constant_(self.linear.weight, 0)
-        nn.init.constant_(self.linear.bias, 0)
+        # 修正: ゼロ初期化をやめ、Xavier初期化を使用
+        nn.init.xavier_uniform_(self.linear.weight, gain=1.0)
+        nn.init.zeros_(self.linear.bias)  # バイアスはゼロのまま
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
-        # 出力範囲を [-1, 1] に制限
-        return torch.tanh(x)  # torch.tanh() を適用
+        return torch.tanh(x)  # 出力範囲を [-1, 1] に制限
+
 
 class DiT_Llama(nn.Module):
     def __init__(
@@ -295,7 +298,6 @@ class DiT_Llama(nn.Module):
         self.freqs_cis = self.freqs_cis.to(x.device)
 
         x = self.init_conv_seq(x)
-
         x = self.patchify(x)
         x = self.x_embedder(x)
 
@@ -308,9 +310,7 @@ class DiT_Llama(nn.Module):
 
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
-
-        # 出力範囲は final_layer で制限済み（torch.tanh() は不要）
-        return x  # すでに [-1, 1] に制限されている
+        return x  # 出力は [-1, 1] に制限済み
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         half = x[: len(x) // 2]
@@ -330,11 +330,14 @@ class DiT_Llama(nn.Module):
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis
 
+
 def DiT_Llama_600M_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=256, n_layers=16, n_heads=32, **kwargs)
 
+
 def DiT_Llama_3B_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=3072, n_layers=32, n_heads=32, **kwargs)
+
 
 if __name__ == "__main__":
     model = DiT_Llama_600M_patch2()
