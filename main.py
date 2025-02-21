@@ -161,6 +161,7 @@ def main():
     for epoch in range(1, epochs + 1):
         model_e.train()
         model_t.eval()
+        losses = []
 
         total_loss = 0
         first_batch = True  # 最初のバッチのみ Input Labels を表示
@@ -184,9 +185,10 @@ def main():
                     param_t.data.mul_(0.999).add_(param_e.data, alpha=1 - 0.999)
 
                 total_loss += loss.item()
+                losses.append(loss.item())
 
                 # tqdm の進行状況バーに現在の損失を表示
-                pbar.set_postfix({"Loss": loss.item()})
+                pbar.set_postfix({"loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
         # 各エポックの平均損失を計算
         avg_loss = total_loss / len(dataloader)
