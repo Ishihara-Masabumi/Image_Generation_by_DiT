@@ -1,3 +1,6 @@
+# Code heavily based on https://github.com/Alpha-VLLM/LLaMA2-Accessory
+# this is modeling code for DiT-LLaMA model
+
 import math
 
 import torch
@@ -7,6 +10,7 @@ import torch.nn.functional as F
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -39,6 +43,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
 class LabelEmbedder(nn.Module):
     def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
@@ -66,6 +71,7 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+
 class Attention(nn.Module):
     def __init__(self, dim, n_heads):
         super().__init__()
@@ -86,6 +92,7 @@ class Attention(nn.Module):
     def reshape_for_broadcast(freqs_cis, x):
         ndim = x.ndim
         assert 0 <= 1 < ndim
+        # assert freqs_cis.shape == (x.shape[1], x.shape[-1])
         _freqs_cis = freqs_cis[: x.shape[1]]
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return _freqs_cis.view(*shape)
@@ -129,6 +136,7 @@ class Attention(nn.Module):
 
         return self.wo(output)
 
+
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier=None):
         super().__init__()
@@ -146,6 +154,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+
 
 class TransformerBlock(nn.Module):
     def __init__(
@@ -178,8 +187,9 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, freqs_cis, adaln_input=None):
         if adaln_input is not None:
-            adaln_out = self.adaLN_modulation(adaln_input)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_out.chunk(6, dim=1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.adaLN_modulation(adaln_input).chunk(6, dim=1)
+            )
 
             x = x + gate_msa.unsqueeze(1) * self.attention(
                 modulate(self.attention_norm(x), shift_msa, scale_msa), freqs_cis
@@ -192,6 +202,7 @@ class TransformerBlock(nn.Module):
             x = x + self.feed_forward(self.ffn_norm(x))
 
         return x
+
 
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
@@ -212,8 +223,8 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
-        # 出力範囲を [-1, 1] に制限
-        return torch.tanh(x)  # torch.tanh() を適用
+        return x
+
 
 class DiT_Llama(nn.Module):
     def __init__(
@@ -309,8 +320,7 @@ class DiT_Llama(nn.Module):
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
 
-        # 出力範囲は final_layer で制限済み（torch.tanh() は不要）
-        return x  # すでに [-1, 1] に制限されている
+        return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         half = x[: len(x) // 2]
@@ -330,11 +340,14 @@ class DiT_Llama(nn.Module):
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis
 
+
 def DiT_Llama_600M_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=256, n_layers=16, n_heads=32, **kwargs)
 
+
 def DiT_Llama_3B_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=3072, n_layers=32, n_heads=32, **kwargs)
+
 
 if __name__ == "__main__":
     model = DiT_Llama_600M_patch2()

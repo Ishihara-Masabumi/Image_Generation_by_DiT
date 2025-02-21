@@ -1,8 +1,8 @@
 {
     "dataset": "cifar",
     "batch_size": 32,
-    "timesteps": 1000,
-    "cfg": 1.5,
+    "timesteps": 100,
+    "cfg": 3.0,
     "model": {
         "in_channels": 3,
         "input_size": 32,
@@ -18,7 +18,7 @@
     },
     "training": {
         "epochs": 300,
-        "learning_rate": 0.0005
+        "learning_rate": 5e-4
     }
 }
 

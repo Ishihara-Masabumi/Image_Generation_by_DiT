@@ -22,6 +22,14 @@ class ConsistencyModel:
         self.model_t = model_t
         self.timesteps = timesteps
         self.ln = ln
+        self.sigma_min = 0.002  # 最小ノイズスケール
+        self.sigma_max = 80.0   # 最大ノイズスケール
+
+    def get_sigma(self, t):
+        """
+        ノイズスケジュールを計算（指数スケジュール）
+        """
+        return self.sigma_min * (self.sigma_max / self.sigma_min) ** t
 
     def forward(self, x, cond):
         """
@@ -30,7 +38,7 @@ class ConsistencyModel:
         1. 0〜1の区間を timesteps 個に線形分割した時刻グリッドを作成。
         2. ランダムに隣接する2つの時刻 t_n と t_{n+1} を選ぶ。
         3. それぞれの時刻に対して、ノイズ z を用い
-           x_t = (1-t)*x + t*z という形でノイズ付与画像を生成。
+           x_t = x + sigma(t) * z という形でノイズ付与画像を生成。
         4. オンラインネットワーク (model_e) は x_{t_{n+1}} と t_{n+1} から予測を行い、
            ターゲットネットワーク (model_t) は x_{t_n} と t_n から予測を行う。
         5. 2つの出力の平方誤差 (MSE) を損失とする。
@@ -44,6 +52,9 @@ class ConsistencyModel:
 
         # 0〜1の時刻グリッドを生成
         t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
+        if self.ln:
+            t_grid = torch.sigmoid(t_grid)  # ln=True の場合、シグモイドを適用
+
         # ランダムに隣接する2つの時刻のインデックスを選択（n in [0, timesteps-2]）
         n = torch.randint(0, self.timesteps - 1, (1,)).item()
         t_n = t_grid[n]       # 早い時刻
@@ -57,22 +68,33 @@ class ConsistencyModel:
         t_n_expanded = t_n_tensor.view(b, *([1] * (x.dim()-1)))
         t_np1_expanded = t_np1_tensor.view(b, *([1] * (x.dim()-1)))
 
+        # ノイズスケジュールを計算
+        sigma_n = self.get_sigma(t_n)
+        sigma_np1 = self.get_sigma(t_np1)
+
         # ノイズを生成して、各時刻の画像を作成
         noise_n = torch.randn_like(x)
         noise_np1 = torch.randn_like(x)
-        x_tn = (1 - t_n_expanded) * x + t_n_expanded * noise_n
-        x_tnp1 = (1 - t_np1_expanded) * x + t_np1_expanded * noise_np1
+        x_tn = x + sigma_n * noise_n  # 指数スケジュールを使用
+        x_tnp1 = x + sigma_np1 * noise_np1
 
         # オンラインネットワーク: t_{n+1} における出力
         y_pred = self.model_e(x_tnp1, t_np1_tensor, cond)
         # ターゲットネットワーク: t_n における出力
         y_target = self.model_t(x_tn, t_n_tensor, cond)
 
-        # MSEを計算（バッチ以外の次元で平均した後、バッチ平均）
+        # MSEを計算（sigmaスケーリングを適用）
         dims = tuple(range(1, y_pred.dim()))
-        loss = ((y_pred - y_target) ** 2).mean(dim=dims).mean()+((x - y_pred) ** 2).mean(dim=list(range(1, len(x.shape)))).mean()
+        loss = ((y_pred - y_target) / (sigma_np1 ** 2)).mean(dim=dims).mean()  # 論文のAlgorithm 3に準拠
 
-        return loss, None
+        print(f"t_n: {t_n}, t_np1: {t_np1}")
+        print(f"sigma_n: {sigma_n}, sigma_np1: {sigma_np1}")
+        print(f"y_pred: {y_pred.mean()}, y_target: {y_target.mean()}")
+        print(f"(y_pred - y_target): {(y_pred - y_target).mean()}")
+        print(f"sigma_np1 ** 2: {sigma_np1 ** 2}")
+        print(f"loss before mean: {((y_pred - y_target) / (sigma_np1 ** 2)).mean()}")
+
+        return loss
 
     @torch.no_grad()
     def sample(self, z, cond, null_cond=None, cfg=2.0):
@@ -87,20 +109,26 @@ class ConsistencyModel:
         """
         b = z.size(0)
         device = z.device
-        dt = 1.0 / self.timesteps
-        dt = torch.tensor([dt] * b, device=device).view(b, *([1] * (z.dim()-1)))
+
         images = [z]
         for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
-            t_val = i / self.timesteps
-            t_tensor = torch.tensor([t_val] * b, device=device)
+            t_val = i / (self.timesteps - 1)  # 0から1の範囲を正確にカバー
+            if self.ln:
+                t_val = torch.sigmoid(torch.tensor(t_val, device=device))  # ln=True の場合、シグモイドを適用
+            t_tensor = torch.tensor([t_val] * b, device=device).view(b, *([1] * (z.dim()-1)))
+
             # オンラインネットワークの出力を取得
             y = self.model_e(z, t_tensor, cond)
             # Classifier-Free Guidance（null_condが指定されている場合）
             if null_cond is not None:
                 y_null = self.model_e(z, t_tensor, null_cond)
                 y = y_null + cfg * (y - y_null)
-            # CTでは、出力が直接 x0 の推定とみなすので、z を更新
-            z = y
+
+            # ノイズスケジュールを計算
+            sigma_t = self.get_sigma(t_val).view(b, *([1] * (z.dim()-1)))
+            noise = torch.randn_like(z) * sigma_t  # ノイズをスケーリング
+            z = y + noise  # モデル予測にノイズを加算
+
             images.append(z)
         return images
 
@@ -317,7 +345,7 @@ def main():
                     c = c.to(device)
 
             optimizer.zero_grad()
-            loss, blsct = cm.forward(x, c)
+            loss = cm.forward(x, c)
             loss.backward()
             optimizer.step()
             # EMAによるターゲットネットワークの更新
@@ -345,7 +373,7 @@ def main():
             save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
 
         # 学習したモデルの保存
-        torch.save(model_e.state_dict(), img_dir / "consistency_model.pth")
+        torch.save(model_e.state_dict(), img_dir / "consistency_training.pth")
 
     print("Training complete.")
 
