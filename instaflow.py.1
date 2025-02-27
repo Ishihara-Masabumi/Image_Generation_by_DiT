@@ -1,0 +1,362 @@
+import math
+import json
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
+from pathlib import Path
+import torch.optim as optim  # Add this line
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.linear1 = nn.Linear(dim, dim * 4)
+        self.linear2 = nn.Linear(dim * 4, dim)
+
+    def forward(self, t):
+        t = t.float()
+        half_dim = self.dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim).to(t.device)
+        args = t[:, None] * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        embedding = self.linear1(embedding)
+        embedding = F.silu(embedding)
+        embedding = self.linear2(embedding)
+        return embedding
+
+class ConditionEmbedding(nn.Module):
+    def __init__(self, num_classes, dim):
+        super().__init__()
+        self.embedding = nn.Embedding(num_classes + 1, dim)  # +1 for null condition
+
+    def forward(self, c):
+        if c is not None:
+            return self.embedding(c)
+        return torch.zeros(c.size(0), self.embedding.embedding_dim, device=c.device)
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_dim=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.norm1 = nn.GroupNorm(num_groups=3, num_channels=3)
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.time_mlp = nn.Linear(time_dim, out_channels) if time_dim else None
+
+    def forward(self, x, t_emb=None):
+        h = self.norm1(x)
+        h = F.relu(h)
+        h = self.conv1(h)
+        h = self.norm2(h)
+        h = F.relu(h)
+        h = self.conv2(h)
+        if t_emb is not None and self.time_mlp is not None:
+            t = self.time_mlp(t_emb).view(h.size(0), -1, 1, 1)
+            h = h + t
+        return x + h  # Residue connection
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, dim=64, n_layers=8, num_classes=11):
+        super().__init__()
+        self.in_channels = in_channels
+        self.dim = dim
+        self.num_classes = num_classes
+
+        # 初期畳み込み
+        self.initial_conv = InitialConv(in_channels=3, out_channels=64)
+
+        # エンコーダ（Conv Block 1〜4 + ダウンサンプリング）
+        encoder_dims = [dim, dim * 2, dim * 4, dim * 8]
+        self.encoder_blocks = nn.ModuleList()
+        self.downsample = nn.MaxPool2d(2, stride=2)
+        in_dim = dim
+        for out_dim in encoder_dims:
+            self.encoder_blocks.append(ConvBlock(in_dim, out_dim, dim * 4))
+            in_dim = out_dim
+
+        # ボトルネック
+        self.bottleneck = ConvBlock(dim * 8, dim * 8, dim * 4)
+
+        # デコーダ（Conv Block 5〜8 + アップサンプリング）
+        decoder_dims = [dim * 8, dim * 4, dim * 2, dim]
+        self.decoder_blocks = nn.ModuleList()
+        self.upsample = nn.ConvTranspose2d(dim * 8, dim * 8, 4, stride=2, padding=1)  # 最初のアップサンプリング
+        in_dim = dim * 8
+        for out_dim in decoder_dims[:-1]:
+            self.decoder_blocks.append(ConvBlock(in_dim + out_dim, out_dim, dim * 4))
+            in_dim = out_dim
+        self.decoder_blocks.append(ConvBlock(in_dim + dim, dim, dim * 4))  # 最後のブロック
+
+        # 最終層
+        self.final_conv = nn.Conv2d(dim, in_channels, 3, padding=1)
+
+        # 時間と条件の埋め込み
+        self.time_emb = TimeEmbedding(dim * 4)
+        self.cond_emb = ConditionEmbedding(num_classes, dim * 4)
+
+    def forward(self, x, t, cond=None):
+        # 時間埋め込み
+        t_emb = self.time_emb(t)
+        # 条件埋め込み
+        c_emb = self.cond_emb(cond)
+
+        # エンコーダ（スキップ接続用の特徴を保存）
+        skips = []
+        h = self.initial_conv(x, t_emb)
+        for block in self.encoder_blocks:
+            skips.append(h)
+            h = block(h, t_emb)
+            h = self.downsample(h)
+
+        # ボトルネック
+        h = self.bottleneck(h, t_emb)
+
+        # デコーダ（スキップ結合を使用）
+        h = self.upsample(h)
+        for i, block in enumerate(self.decoder_blocks):
+            skip = skips[-(i + 1)]  # 対応するエンコーダの特徴
+            h = torch.cat([h, skip], dim=1)  # スキップ結合
+            h = block(h, t_emb)
+
+        # 最終層
+        output = self.final_conv(h)
+        return output
+
+# Rectified Flow用のUNetクラス
+class RF:
+    def __init__(self, model, timesteps, ln=True):
+        self.model = model
+        self.ln = ln
+        self.timesteps = timesteps
+
+    def forward(self, x, cond):
+        """
+        Rectified Flowの損失計算（1ステップ）
+
+        Args:
+            x: 入力画像（[B, C, H, W]、[-1, 1]正規化）
+            cond: 条件（クラスラベル、[B]）
+
+        Returns:
+            loss: 平均二乗誤差（スカラー）
+            info: ログ情報（タプルのリスト、(t, loss)）
+        """
+        b = x.size(0)
+        device = x.device
+
+        # InstaFlowの1ステップ用にt=0.5を固定
+        if self.ln:
+            t = torch.sigmoid(torch.randn((b,)).to(device))
+        else:
+            t = torch.full((b,), 0.5, device=device)  # 単一ステップ用
+
+        texp = t.view(b, *[1] * (x.dim() - 1))
+        z1 = torch.randn_like(x, device=device)
+        zt = (1 - texp) * x + texp * z1  # ノイズ付与
+
+        # UNetでノイズ予測
+        vtheta = self.model(zt, t, cond)  # vc = self.model(z, t, cond)
+        batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
+        tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
+        ttloss = [(tv.item(), tloss) for tv, tloss in zip(t, tlist)]
+
+        return batchwise_mse.mean(), ttloss
+
+    @torch.no_grad()
+    def sample(self, z, cond, null_cond=None, cfg=2.0):
+        """
+        InstaFlowの1ステップサンプリング
+
+        Args:
+            z: 初期ノイズ（[B, C, H, W]）
+            cond: 条件（クラスラベル、[B]）
+            null_cond: 無条件入力（Classifier-Free Guidance用）
+            cfg: Classifier-Free Guidanceスケール
+
+        Returns:
+            images: 最終的な生成画像（1ステップ）
+        """
+        device = z.device
+        t = torch.ones([z.shape[0]], device=device)  # 1ステップ用t=1（開始点）
+        texp = t.view(z.shape[0], *[1] * (z.dim() - 1))
+        dt = torch.tensor([1.0], device=device).view(1, *[1] * (z.dim() - 1))
+
+        # モデルでノイズ予測
+        vc = self.model(z, t, cond)
+
+        # Classifier-Free Guidance
+        if null_cond is not None:
+            vu = self.model(z, t, null_cond)
+            vc = vu + cfg * (vc - vu)
+
+        # 1ステップでデノイズ（Rectified Flowの単一ステップ）
+        z = z - dt * vc
+        final_image = z.clamp(-1, 1)  # [-1, 1]の範囲にクランプ
+        return [final_image]  # 1ステップのみのリスト
+
+# -------------------------------
+# Main function: 設定ファイルの読み込みと学習処理
+# -------------------------------
+def main():
+    # コマンドライン引数でデータセットを選択
+    parser = argparse.ArgumentParser(description="Choose dataset among: mnist, cifar, fashion_mnist, huggan")
+    parser.add_argument("--dataset", type=str, default="mnist",
+                        choices=["mnist", "cifar", "fashion_mnist", "huggan"],
+                        help="Dataset to use (default: mnist)")
+    args = parser.parse_args()
+
+    # 選択された dataset に対応する config ファイルのパスを設定
+    if args.dataset == "mnist":
+        config_path = "./configs/mnist.json"
+    elif args.dataset == "cifar":
+        config_path = "./configs/cifar.json"
+    elif args.dataset == "fashion_mnist":
+        config_path = "./configs/fashion_mnist.json"
+    elif args.dataset == "huggan":
+        config_path = "./configs/huggan_AFHQv2.json"
+    else:
+        raise ValueError("Unknown dataset")
+
+    # 設定ファイルの読み込み
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # device の設定
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # config から画像サイズ、バッチサイズなどを取得
+    batch_size = config["batch_size"]
+    timesteps = config["timesteps"]
+    cfg = config["cfg"]
+
+    # モデルの in_channels（チャネル数）は config["model"]["in_channels"] を使用
+    channels = config["model"]["in_channels"]
+    # モデルの image_size は config["model"]["input_size"] とする
+    image_size = config["model"]["input_size"]
+    
+    # データセットと前処理の設定（config["dataset"] も参考に）
+    if config["dataset"] in ["cifar"]:
+        dataset_name = "cifar"
+        fdataset = datasets.CIFAR10
+        transform = transforms.Compose([
+            transforms.RandomCrop(image_size, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
+    elif config["dataset"] in ["fashion_mnist"]:
+        dataset_name = "fashion_mnist"
+        fdataset = datasets.FashionMNIST
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
+    elif config["dataset"] in ["huggan", "huggan/AFHQv2"]:
+        from datasets import load_dataset
+        dataset = load_dataset("huggan/afhqv2")["train"].filter(lambda x: x["label"] == 0)
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        dataset = dataset.map(lambda x: {"image": transform(x["image"]) * 2 - 1})  # [-1, 1]に正規化
+        dataset.set_format("torch", columns=["image", "label"])
+    else:  # デフォルトは mnist
+        dataset_name = "mnist"
+        fdataset = datasets.MNIST
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: (x * 2) - 1)
+        ])
+        dataset = fdataset(root="./data", train=True, download=True, transform=transform)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+    # UNetモデルの初期化
+    model = UNet(
+        in_channels=channels,
+        dim=64,
+        n_layers=8,  # 図の8ブロックに合わせる
+        num_classes=config["model"]["num_classes"] + 1  # CIFAR-10 + null_cond
+    ).to(device)
+
+    # 学習パラメータ：config["training"]
+    training_config = config["training"]
+    epochs = training_config["epochs"]
+    lr = training_config["learning_rate"]
+
+    # 出力先ディレクトリの作成
+    output_dir = "outputs"
+    img_dir = Path(output_dir, f"{config['dataset']}")
+    img_dir.mkdir(exist_ok=True, parents=True)
+
+    # RF クラスの初期化
+    rf = RF(model, timesteps=timesteps)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # 学習ループ
+    for epoch in range(1, epochs + 1):
+        losses = []
+        bar = tqdm(dataloader, desc=f"Epoch {epoch}", total=len(dataloader))
+        model.train()
+
+        for batch in bar:
+            if config["dataset"] in ["huggan/AFHQv2", "huggan"]:
+                x = batch['image'].type(torch.float32).to(device)  # (B, C, H, W)
+                if 'label' in batch and batch['label'] is not None:
+                    if isinstance(batch['label'], torch.Tensor):
+                        c = batch['label'].to(device)
+                    else:
+                        c = torch.tensor(batch['label']).to(device)
+                else:
+                    c = None
+            else:
+                x, c = batch
+                x = x.to(device)  # (B, C, H, W)
+                if isinstance(c, torch.Tensor):
+                    c = c.to(device)
+                else:
+                    c = torch.tensor(c).to(device) if c is not None else None
+
+            optimizer.zero_grad()
+            loss, blsct = rf.forward(x, c)
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
+
+        # サンプル生成（1ステップ）
+        rf.model.eval()
+        with torch.no_grad():
+            cond = torch.arange(0, 16).to(device) % config["model"]["num_classes"]
+            uncond = torch.ones_like(cond) * config["model"]["num_classes"]
+
+            init_noise = torch.randn(16, channels, image_size, image_size).to(device)
+            images = rf.sample(init_noise, cond, uncond, cfg)
+
+            # 生成された画像列のうち、最終ステップの画像を使用
+            final_image = images[-1]
+            # 画像の値を [-1, 1] から [0, 1] に戻す（unnormalize）
+            final_image = final_image * 0.5 + 0.5
+            final_image = final_image.clamp(0, 1)
+            # 複数画像の場合は、グリッド状にまとめる（4x4グリッド）
+            grid = make_grid(final_image.float(), nrow=4)
+            # 画像を保存
+            save_image(grid, f"{img_dir}/sample_{epoch}_last.png")
+
+        # 学習したモデルの保存
+        torch.save(model.state_dict(), img_dir / "rectified_flow_unet.pth")
+
+    print("Training complete.")
+
+if __name__ == "__main__":
+    main()
