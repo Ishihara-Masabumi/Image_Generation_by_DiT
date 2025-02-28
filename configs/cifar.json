@@ -1,7 +1,7 @@
 {
     "dataset": "cifar",
     "batch_size": 32,
-    "timesteps": 10,
+    "timesteps": 5,
     "cfg": 3.0,
     "model": {
         "in_channels": 3,

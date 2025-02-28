@@ -365,12 +365,13 @@ class InstaFlow:
         # 0〜1の時刻グリッドを生成
         t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
         # ランダムに隣接する2つの時刻のインデックスを選択（n in [0, timesteps-1]）
-        n = torch.randint(0, self.timesteps, (b,), device=device)
+        n = torch.randint(1, self.timesteps, (b,), device=device)
         t = t_grid[n]
         # 画像テンソルとブロードキャスト可能な形状に拡張
         texp = t.view(b, 1, 1, 1)
 
         z1 = torch.randn_like(x)
+        z1 = torch.clamp(z1, min=-3.0, max=3.0)  # 値を[-3, 3]に制限
         zt = (1 - texp) * x + texp * z1
         vtheta = self.model(zt, t, cond)  # U-Net takes zt, t, and cond as input
         batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
@@ -495,7 +496,7 @@ def main():
     img_dir.mkdir(exist_ok=True, parents=True)
 
     # Initialize InstaFlow and optimizer
-    instaf =InstaFlow(model, timesteps=timesteps)
+    inflow =InstaFlow(model, timesteps=timesteps)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Training loop
