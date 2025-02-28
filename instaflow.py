@@ -374,6 +374,7 @@ class InstaFlow:
         z1 = torch.clamp(z1, min=-3.0, max=3.0)  # 値を[-3, 3]に制限
         zt = (1 - texp) * x + texp * z1
         vtheta = self.model(zt, t, cond)  # U-Net takes zt, t, and cond as input
+        vtheta = torch.clamp(vtheta, min=-10.0, max=10.0)  # 出力制限
         batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
         tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
         ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
@@ -541,7 +542,7 @@ def main():
             save_image(grid, f"{img_dir}/sample_{epoch}.png")
 
         # Save model
-        torch.save(model.state_dict(), img_dir / "unet_rectified_flow.pth")
+        torch.save(model.state_dict(), img_dir / "unet_insta_flow.pth")
 
     print("Training complete.")
 
