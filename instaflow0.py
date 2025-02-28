@@ -349,27 +349,20 @@ class Unet(nn.Module):
         return self.final_conv(x)
 
 # Rectified Flow Class
-class InstaFlow:
+class RF:
     def __init__(self, model, timesteps, ln=True):
         self.model = model
         self.ln = ln
         self.timesteps = timesteps
-        if self.timesteps < 2:
-            print("timesteps is wrong.")
-            return
 
     def forward(self, x, cond):
         b = x.size(0)
-        device = x.device
-
-        # 0〜1の時刻グリッドを生成
-        t_grid = torch.linspace(0, 1, steps=self.timesteps, device=device)
-        # ランダムに隣接する2つの時刻のインデックスを選択（n in [0, timesteps-1]）
-        n = torch.randint(0, self.timesteps, (b,), device=device)
-        t = t_grid[n]
-        # 画像テンソルとブロードキャスト可能な形状に拡張
-        texp = t.view(b, 1, 1, 1)
-
+        if self.ln:
+            nt = torch.randn((b,)).to(x.device)
+            t = torch.sigmoid(nt)
+        else:
+            t = torch.rand((b,)).to(x.device)
+        texp = t.view([b, *([1] * len(x.shape[1:]))])
         z1 = torch.randn_like(x)
         zt = (1 - texp) * x + texp * z1
         vtheta = self.model(zt, t, cond)  # U-Net takes zt, t, and cond as input
@@ -381,11 +374,11 @@ class InstaFlow:
     @torch.no_grad()
     def sample(self, z, cond, null_cond, cfg=2.0):
         b = z.size(0)
-        dt = 1.0 / (self.timesteps - 1)
+        dt = 1.0 / self.timesteps
         dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
         images = [z]
-        for i in tqdm(reversed(range(1, self.timesteps)), desc='sampling loop time step', total=self.timesteps-1):
-            t = i / (self.timesteps - 1)
+        for i in tqdm(reversed(range(self.timesteps)), desc='sampling loop time step', total=self.timesteps):
+            t = i / self.timesteps
             t = torch.tensor([t] * b).to(z.device)
 
             vc = self.model(z, t, cond)
@@ -494,8 +487,8 @@ def main():
     img_dir = Path(output_dir, f"{config['dataset']}")
     img_dir.mkdir(exist_ok=True, parents=True)
 
-    # Initialize InstaFlow and optimizer
-    instaf =InstaFlow(model, timesteps=timesteps)
+    # Initialize RF and optimizer
+    rf = RF(model, timesteps=timesteps)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Training loop
@@ -518,20 +511,20 @@ def main():
                     c = c.to(device)
 
             optimizer.zero_grad()
-            loss, blsct = inflow.forward(x, c)
+            loss, blsct = rf.forward(x, c)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
         # Sampling
-        inflow.model.eval()
+        rf.model.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).to(device) % config["model"]["num_classes"]
             uncond = torch.ones_like(cond) * config["model"]["num_classes"]
 
             init_noise = torch.randn(16, channels, image_size, image_size).to(device)
-            images = inflow.sample(init_noise, cond, uncond, cfg)
+            images = rf.sample(init_noise, cond, uncond, cfg)
 
             final_image = images[-1]
             final_image = final_image * 0.5 + 0.5  # Unnormalize from [-1, 1] to [0, 1]
