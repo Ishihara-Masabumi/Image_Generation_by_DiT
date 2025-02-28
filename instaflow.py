@@ -349,8 +349,9 @@ class Unet(nn.Module):
         return self.final_conv(x)
 
 # Rectified Flow Class
-class InstaFlow:
+class InstaFlow(nn.Module):  # nn.Moduleを継承
     def __init__(self, model, timesteps, ln=True):
+        super().__init__()  # 最初に呼び出し
         self.model = model
         self.ln = ln
         self.timesteps = timesteps
@@ -522,6 +523,7 @@ def main():
             optimizer.zero_grad()
             loss, blsct = inflow.forward(x, c)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(inflow.parameters(), max_norm=1.0)  # 勾配制限
             optimizer.step()
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
