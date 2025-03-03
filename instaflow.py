@@ -435,6 +435,7 @@ def main():
     cfg = config["cfg"]
     channels = config["model"]["in_channels"]
     image_size = config["model"]["input_size"]
+    dim = config["model"]["dim"]
 
     # Dataset and preprocessing
     if config["dataset"] in ["cifar"]:
@@ -485,7 +486,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     # Initialize U-Net model
-    model = Unet(dim=64, channels=3).to(device)
+    model = Unet(dim=image_size, channels=3).to(device)
 
     # Training parameters
     training_config = config["training"]
@@ -500,6 +501,7 @@ def main():
     # Initialize InstaFlow and optimizer
     inflow =InstaFlow(model, timesteps=timesteps)
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -525,6 +527,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(inflow.parameters(), max_norm=1.0)  # 勾配制限
             optimizer.step()
+            scheduler.step()  # スケジューラ更新
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 

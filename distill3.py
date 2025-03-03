@@ -369,8 +369,8 @@ def main():
     trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     class_names = trainset.classes
     triplets = []
-    num_triplets = 50000
-    batch_size = 8
+    num_triplets = 4000
+    batch_size = 4
 
     with torch.no_grad():
         for _ in tqdm(range(num_triplets // batch_size), desc="Generating triplets"):
