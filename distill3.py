@@ -352,8 +352,8 @@ def main():
     else:
         raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
 
-    optimizer = optim.Adam(instaf.parameters(), lr=5e-4)
-    epochs = 2
+    optimizer = optim.Adam(instaf.parameters(), lr=2e-4)
+    epochs = 100
 
     # Step 1: Stable Diffusionからトリプレットを生成
     print("Step 1: Generating (text, noise, image) triplets from Stable Diffusion...")
@@ -369,8 +369,8 @@ def main():
     trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     class_names = trainset.classes
     triplets = []
-    num_triplets = 10
-    batch_size = 4
+    num_triplets = 50000
+    batch_size = 8
 
     with torch.no_grad():
         for _ in tqdm(range(num_triplets // batch_size), desc="Generating triplets"):
