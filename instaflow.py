@@ -501,7 +501,7 @@ def main():
     # Initialize InstaFlow and optimizer
     inflow =InstaFlow(model, timesteps=timesteps)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
+    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -527,7 +527,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(inflow.parameters(), max_norm=1.0)  # 勾配制限
             optimizer.step()
-            scheduler.step()  # スケジューラ更新
+            #scheduler.step()  # スケジューラ更新
             losses.append(loss.item())
             bar.set_postfix({"Average Loss": f"{torch.mean(torch.tensor(losses)):.4f}"})
 
@@ -547,7 +547,7 @@ def main():
             save_image(grid, f"{img_dir}/sample_{epoch}.png")
 
         # Save model
-        torch.save(model.state_dict(), img_dir / "unet_insta_flow.pth")
+        torch.save(model.state_dict(), img_dir / f"unet_insta_flow_{epoch}.pth")
 
     print("Training complete.")
 
