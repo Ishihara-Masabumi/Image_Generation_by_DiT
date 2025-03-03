@@ -30,7 +30,6 @@ class InstaFlow(nn.Module):
         z1 = torch.clamp(z1, min=-3.0, max=3.0)
         zt = (1 - texp) * x + texp * z1
         
-        # condを[batch_size, 1, cross_attention_dim]に調整
         cond = cond.unsqueeze(1)  # [b, 1, 10]
         vtheta = self.model(zt, t, encoder_hidden_states=cond)
         batchwise_mse = ((z1 - x - vtheta.sample) ** 2).mean(dim=list(range(1, len(x.shape))))
@@ -127,7 +126,7 @@ def main():
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.nn.functional.one_hot(torch.randint(0, 10, (16,), device=device), num_classes=10).float()
         generated = instaf.sample(z_sample, cond_sample)
-        save_image(generated, f"samples/stage1_batch{batch_idx}_samples.png", nrow=4, normalize=True)
+        save_image(generated, f"samples/stage1_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
     torch.save(instaf.state_dict(), "checkpoints/1_rectified.pth")
 
@@ -156,7 +155,7 @@ def main():
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample_gen = torch.nn.functional.one_hot(torch.randint(0, 10, (16,), device=device), num_classes=10).float()
         generated = instaf.sample(z_sample, cond_sample_gen)
-        save_image(generated, f"samples/stage2_batch{batch_idx}_samples.png", nrow=4, normalize=True)
+        save_image(generated, f"samples/stage2_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
     torch.save(instaf.state_dict(), "checkpoints/2_rectified.pth")
 
@@ -181,7 +180,7 @@ def main():
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample_gen = torch.nn.functional.one_hot(torch.randint(0, 10, (16,), device=device), num_classes=10).float()
         generated = instaf.sample(z_sample, cond_sample_gen)
-        save_image(generated, f"samples/stage3_batch{batch_idx}_samples.png", nrow=4, normalize=True)
+        save_image(generated, f"samples/stage3_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
     torch.save(instaf.state_dict(), "checkpoints/3_rectified.pth")
 
