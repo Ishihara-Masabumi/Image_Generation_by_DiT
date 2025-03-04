@@ -351,7 +351,7 @@ def main():
         print(f"Loading pre-trained model from {checkpoint_path}...")
         unet.load_state_dict(torch.load(checkpoint_path, map_location=device))
     else:
-        raise FileNotFoundError(f"Checkpoint file {checkpoint_path} not found!")
+        print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
 
     optimizer = optim.Adam(instaf.parameters(), lr=2e-4)
     epochs = 100
@@ -408,7 +408,7 @@ def main():
         print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
 
         z_sample = torch.randn(16, 3, 32, 32).to(device)
-        cond_sample = torch.randint(0, 10, (16,), device=device)
+        cond_sample = torch.arange(0, 16).to(device) % 10
         generated = instaf.sample(z_sample, cond_sample)
         save_image(generated, f"samples/stage2_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
@@ -430,7 +430,7 @@ def main():
         print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
 
         z_sample = torch.randn(16, 3, 32, 32).to(device)
-        cond_sample = torch.randint(0, 10, (16,), device=device)
+        cond_sample = torch.arange(0, 16).to(device) % 10
         generated = instaf.sample(z_sample, cond_sample, steps=2)
         save_image(generated, f"samples/stage3_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
@@ -438,7 +438,7 @@ def main():
 
     print("Generating final samples...")
     z = torch.randn(16, 3, 32, 32).to(device)
-    cond_final = torch.randint(0, 10, (16,), device=device)
+    cond_final = torch.arange(0, 16).to(device) % 10
     generated = instaf.sample(z, cond_final, steps=2)
     save_image(generated, f"samples/final_samples.png", nrow=4, normalize=True)
     print(f"Generated shape: {generated.shape}")
