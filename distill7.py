@@ -369,9 +369,9 @@ def main():
     else:
         print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
 
-    optimizer = optim.Adam(instaf1.parameters(), lr=1e-4)
-    optimizer = optim.Adam(instaf2.parameters(), lr=1e-4)
-    epochs = 100
+    optimizer = optim.Adam(instaf1.parameters(), lr=5e-4)
+    optimizer = optim.Adam(instaf2.parameters(), lr=5e-4)
+    epochs = 200
 
     # Step 1: Stable Diffusionからトリプレットを生成
     print("Step 1: Generating (text, noise, image) triplets from Stable Diffusion...")
@@ -389,8 +389,8 @@ def main():
 
     # 例として400枚 (batch_size=4 で 100バッチ) のサンプルを生成
     triplets = []
-    num_triplets = 400
-    batch_size = 8
+    num_triplets = 50000
+    batch_size = 16
 
     with torch.no_grad():
         for _ in tqdm(range(num_triplets // batch_size), desc="Generating triplets"):

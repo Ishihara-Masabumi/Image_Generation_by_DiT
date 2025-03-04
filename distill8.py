@@ -358,7 +358,8 @@ def main():
         dim_mults=(1, 2, 4, 8),
         resnet_block_groups=8
     ).to(device)
-    instaf = InstaFlow(unet, timesteps=5).to(device)
+    instaf1 = InstaFlow(unet, timesteps=5).to(device)
+    instaf2 = InstaFlow(unet, timesteps=5).to(device)
 
     # samples/unet_insta_flow.pthをUnetにロード
     checkpoint_path = "samples/unet_insta_flow.pth"
@@ -368,34 +369,34 @@ def main():
     else:
         print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
 
-    optimizer = optim.Adam(instaf.parameters(), lr=1e-4)
-    epochs = 100
+    optimizer = optim.Adam(instaf1.parameters(), lr=5e-4)
+    optimizer = optim.Adam(instaf2.parameters(), lr=5e-4)
+    epochs = 200
 
+    # 使用するバッチサイズとデバイスの設定
+    batch_size = 32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # CIFAR‑10 の画像を32×32にリサイズし、Tensor化および正規化する変換
     transform = transforms.Compose([
+        transforms.Resize((32, 32)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    batch_size = 32
 
-    # CIFAR‑10 の学習用データセットをダウンロード
+    # CIFAR‑10の学習用データセットをダウンロード
     trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     dataloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
-    # Step 1: Stable Diffusionからトリプレットを生成
-    print("Step 1: Generating (text, noise, image) triplets from Stable Diffusion...")
-    # 各バッチで、(labels, noise, images) のトリプレットを生成
+    # Step 1: triplets: (数字ラベル, ランダムな時間, 画像) のタプルをバッチ単位で作成
     triplets = []
     with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc="Generating triplets"):
+        for images, labels in tqdm(dataloader, desc="Generating teacher triplets"):
             images = images.to(device)
             labels = labels.to(device)
-            # ノイズは教師画像と同じサイズでランダムに生成
+            # バッチごとに各サンプルのランダムな時間（0〜1）を生成
             noise = torch.randn_like(images)
             triplets.append((labels, noise, images))
-
-        os.makedirs("checkpoints", exist_ok=True)
-        os.makedirs("samples", exist_ok=True)
 
     # Step 2: 2-Rectified Flowのトレーニング (修正箇所)
     print("Step 2: Training 2-Rectified Flow with text-conditioned reflow...")
@@ -407,12 +408,12 @@ def main():
             images, labels, noise = images.to(device), labels.to(device), noise.to(device)
 
             # reflow学習
-            loss, _ = instaf.reflow(images, noise, labels)
+            loss, _ = instaf1.reflow(images, noise, labels)
             total_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(instaf1.parameters(), max_norm=1.0)
             optimizer.step()
 
         avg_loss = total_loss / len(triplets)
@@ -421,10 +422,10 @@ def main():
         # サンプル生成
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.arange(0, 16).to(device) % 10
-        generated = instaf.sample(z_sample, cond_sample)
+        generated = instaf1.sample(z_sample, cond_sample)
         save_image(generated, f"samples/stage2_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
-    torch.save(instaf.state_dict(), "checkpoints/2_rectified.pth")
+    torch.save(instaf1.state_dict(), "checkpoints/2_rectified.pth")
 
     # Step 3: One-Step InstaFlowへの蒸留
     print("Step 3: Distilling to One-Step InstaFlow...")
@@ -433,12 +434,15 @@ def main():
         for labels, noise, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
             images, labels, noise = images.to(device), labels.to(device), noise.to(device)
 
-            loss, _ = instaf.distill(images, noise, labels)
+            # 毎バッチでペアを生成
+            z0, z1 = instaf1.generate_pairs(images, labels)
+
+            loss, _ = instaf2.distill(z0, noise, labels)
             total_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(instaf2.parameters(), max_norm=1.0)
             optimizer.step()
 
         avg_loss = total_loss / len(triplets)
@@ -446,15 +450,15 @@ def main():
 
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.arange(0, 16).to(device) % 10
-        generated = instaf.sample(z_sample, cond_sample, steps=2)
+        generated = instaf2.sample(z_sample, cond_sample, steps=2)
         save_image(generated, f"samples/stage3_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
-    torch.save(instaf.state_dict(), "checkpoints/instaflow.pth")
+    torch.save(instaf2.state_dict(), "checkpoints/instaflow.pth")
 
     print("Generating final samples...")
     z = torch.randn(16, 3, 32, 32).to(device)
     cond_final = torch.arange(0, 16).to(device) % 10
-    generated = instaf.sample(z, cond_final, steps=2)
+    generated = instaf2.sample(z, cond_final, steps=2)
     save_image(generated, f"samples/final_samples.png", nrow=4, normalize=True)
     print(f"Generated shape: {generated.shape}")
 

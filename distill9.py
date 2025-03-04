@@ -1,12 +1,19 @@
 import math
 import os
+import sys
+import urllib.request
 from functools import partial
 from inspect import isfunction
 
+sys.path.insert(0, "./edm")  # EDM のパスを先頭に追加
+sys.path.insert(0, "./edm/torch_utils")  # torch_utils のパスを先頭に追加
+import dnnlib
+import legacy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch_utils.misc
 import torchvision
 from diffusers import StableDiffusionPipeline
 from einops import einsum, rearrange, reduce
@@ -358,7 +365,8 @@ def main():
         dim_mults=(1, 2, 4, 8),
         resnet_block_groups=8
     ).to(device)
-    instaf = InstaFlow(unet, timesteps=5).to(device)
+    instaf1 = InstaFlow(unet, timesteps=5).to(device)
+    instaf2 = InstaFlow(unet, timesteps=5).to(device)
 
     # samples/unet_insta_flow.pthをUnetにロード
     checkpoint_path = "samples/unet_insta_flow.pth"
@@ -368,34 +376,48 @@ def main():
     else:
         print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
 
-    optimizer = optim.Adam(instaf.parameters(), lr=1e-4)
-    epochs = 100
+    optimizer = optim.Adam(instaf1.parameters(), lr=5e-4)
+    optimizer = optim.Adam(instaf2.parameters(), lr=5e-4)
+    epochs = 200
+    num_triplets = 50000
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    # 使用するバッチサイズとデバイスの設定
     batch_size = 32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # CIFAR‑10 の学習用データセットをダウンロード
-    trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    dataloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+    # 事前学習済みEDMモデル（CIFAR‑10 条件付き）のダウンロードと読み込み
+    model_url = "https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl"
+    model_path = "edm-cifar10-32x32-cond-vp.pkl"
+    if not os.path.exists(model_path):
+        print("Downloading pretrained conditional EDM model...")
+        urllib.request.urlretrieve(model_url, model_path)
+    with dnnlib.util.open_url(model_path) as f:
+        edm_model = legacy.load_network_pkl(f)["ema"]
+    edm_model.to(device)
+    edm_model.eval()
 
-    # Step 1: Stable Diffusionからトリプレットを生成
+    # EDMモデルから条件付き画像をサンプルする関数
+    def sample_edm(model, batch_size, labels, device):
+        # 32x32の画像を生成するための初期ノイズ
+        noise = torch.randn(batch_size, 3, 32, 32).to(device)
+        labels = labels.to(device)  # ラベルをデバイスに移動
+        # ここは実際のサンプリング手順に合わせて調整してください。
+        with torch.no_grad():
+            # ラベルを条件として EDM モデルで画像生成
+            images = model.sample(noise, labels)  # 例: model.sample(noise, labels)
+        return images
+
+    # Step 1: 既存のモデルからトリプレットを生成
     print("Step 1: Generating (text, noise, image) triplets from Stable Diffusion...")
-    # 各バッチで、(labels, noise, images) のトリプレットを生成
+    # 教師データのトリプレット (labels, teacher_time, teacher_images) をバッチ単位で生成
     triplets = []
-    with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc="Generating triplets"):
-            images = images.to(device)
-            labels = labels.to(device)
-            # ノイズは教師画像と同じサイズでランダムに生成
-            noise = torch.randn_like(images)
-            triplets.append((labels, noise, images))
-
-        os.makedirs("checkpoints", exist_ok=True)
-        os.makedirs("samples", exist_ok=True)
+    for _ in tqdm(range(num_triplets // batch_size), desc="Generating teacher triplets"):
+        # 0～9の整数ラベルをランダムに生成
+        labels = torch.randint(0, 10, (batch_size,), device=device)
+        # EDMモデルから教師画像を生成（ラベルを条件として渡す）
+        teacher_images = sample_edm(edm_model, batch_size, labels, device)
+        # トリプレットとして (labels, teacher_time, teacher_images) を保存
+        triplets.append((labels, teacher_images))
 
     # Step 2: 2-Rectified Flowのトレーニング (修正箇所)
     print("Step 2: Training 2-Rectified Flow with text-conditioned reflow...")
@@ -403,16 +425,17 @@ def main():
     for epoch in range(epochs):
         total_loss = 0
         # triplets全体を回して学習
-        for labels, noise, images in tqdm(triplets, desc=f"Epoch {epoch+1} (2-Rectified)"):
-            images, labels, noise = images.to(device), labels.to(device), noise.to(device)
+        for labels, images in tqdm(triplets, desc=f"Epoch {epoch+1} (2-Rectified)"):
+            images, labels = images.to(device), labels.to(device)
+            noises = torch.randn(batch_size, 3, 32, 32).to(device)
 
             # reflow学習
-            loss, _ = instaf.reflow(images, noise, labels)
+            loss, _ = instaf1.reflow(images, noises, labels)
             total_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(instaf1.parameters(), max_norm=1.0)
             optimizer.step()
 
         avg_loss = total_loss / len(triplets)
@@ -421,24 +444,28 @@ def main():
         # サンプル生成
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.arange(0, 16).to(device) % 10
-        generated = instaf.sample(z_sample, cond_sample)
+        generated = instaf1.sample(z_sample, cond_sample)
         save_image(generated, f"samples/stage2_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
-    torch.save(instaf.state_dict(), "checkpoints/2_rectified.pth")
+    torch.save(instaf1.state_dict(), "checkpoints/2_rectified.pth")
 
     # Step 3: One-Step InstaFlowへの蒸留
     print("Step 3: Distilling to One-Step InstaFlow...")
     for epoch in range(epochs):
         total_loss = 0
-        for labels, noise, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
-            images, labels, noise = images.to(device), labels.to(device), noise.to(device)
+        for labels, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
+            images, labels = images.to(device), labels.to(device)
+            noises = torch.randn(batch_size, 3, 32, 32).to(device)
 
-            loss, _ = instaf.distill(images, noise, labels)
+            # 毎バッチでペアを生成
+            z0, z1 = instaf1.generate_pairs(images, labels)
+
+            loss, _ = instaf2.distill(z0, noises, labels)
             total_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(instaf2.parameters(), max_norm=1.0)
             optimizer.step()
 
         avg_loss = total_loss / len(triplets)
@@ -446,15 +473,15 @@ def main():
 
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.arange(0, 16).to(device) % 10
-        generated = instaf.sample(z_sample, cond_sample, steps=2)
+        generated = instaf2.sample(z_sample, cond_sample, steps=2)
         save_image(generated, f"samples/stage3_epoch{epoch+1}_samples.png", nrow=4, normalize=True)
 
-    torch.save(instaf.state_dict(), "checkpoints/instaflow.pth")
+    torch.save(instaf2.state_dict(), "checkpoints/instaflow.pth")
 
     print("Generating final samples...")
     z = torch.randn(16, 3, 32, 32).to(device)
     cond_final = torch.arange(0, 16).to(device) % 10
-    generated = instaf.sample(z, cond_final, steps=2)
+    generated = instaf2.sample(z, cond_final, steps=2)
     save_image(generated, f"samples/final_samples.png", nrow=4, normalize=True)
     print(f"Generated shape: {generated.shape}")
 
