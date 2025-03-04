@@ -181,25 +181,31 @@ class Unet(nn.Module):
         input_channels = channels * (2 if self_condition else 1)
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 1, padding=0)
+
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
+
         block_klass = partial(ResnetBlock, groups=resnet_block_groups)
         time_dim = dim * 4
+
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(dim),
             nn.Linear(dim, time_dim),
             nn.GELU(),
             nn.Linear(time_dim, time_dim),
         )
+
         self.cond_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(dim),
             nn.Linear(dim, time_dim),
             nn.GELU(),
             nn.Linear(time_dim, time_dim),
         )
+
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
+
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
             self.downs.append(
@@ -212,10 +218,12 @@ class Unet(nn.Module):
                     ]
                 )
             )
+
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
+
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
             self.ups.append(
@@ -228,6 +236,7 @@ class Unet(nn.Module):
                     ]
                 )
             )
+
         self.out_dim = default(out_dim, channels)
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
@@ -236,11 +245,14 @@ class Unet(nn.Module):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim=1)
+
         x = self.init_conv(x)
         r = x.clone()
+
         t = self.time_mlp(time)
         c = self.cond_mlp(cond)
         emb = t + c
+
         h = []
         for block1, block2, attn, downsample in self.downs:
             x = block1(x, emb)
@@ -249,9 +261,11 @@ class Unet(nn.Module):
             x = attn(x)
             h.append(x)
             x = downsample(x)
+
         x = self.mid_block1(x, emb)
         x = self.mid_attn(x)
         x = self.mid_block2(x, emb)
+
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x, emb)
@@ -259,6 +273,7 @@ class Unet(nn.Module):
             x = block2(x, emb)
             x = attn(x)
             x = upsample(x)
+
         x = torch.cat((x, r), dim=1)
         x = self.final_res_block(x, emb)
         return self.final_conv(x)
@@ -353,7 +368,7 @@ def main():
     else:
         print(f"Checkpoint file {checkpoint_path} not found. Using newly initialized model.")
 
-    optimizer = optim.Adam(instaf.parameters(), lr=2e-4)
+    optimizer = optim.Adam(instaf.parameters(), lr=1e-4)
     epochs = 100
 
     # Step 1: Stable Diffusionからトリプレットを生成
@@ -369,44 +384,60 @@ def main():
     ])
     trainset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     class_names = trainset.classes
+
+    # 例として400枚 (batch_size=4 で 100バッチ) のサンプルを生成
     triplets = []
     num_triplets = 400
-    batch_size = 4
+    batch_size = 8
 
     with torch.no_grad():
         for _ in tqdm(range(num_triplets // batch_size), desc="Generating triplets"):
             labels = torch.randint(0, 10, (batch_size,), device=device)
             prompts = [f"A photo of {class_names[label.item()]}" for label in labels]
-            text_inputs = tokenizer(prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
+            text_inputs = tokenizer(
+                prompts,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).input_ids.to(device)
+
             text_embeds = text_encoder(text_inputs)[0]
             latents = torch.randn(batch_size, 4, 64, 64).to(device)
             images = pipe(prompts, latents=latents, num_inference_steps=50).images
+
             images = torch.stack([transforms.ToTensor()(img) for img in images]).to(device)
             images = transforms.Resize((32, 32))(images)
             images = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))(images)
+
             noise = torch.randn_like(images)
             triplets.append((labels, noise, images))
 
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("samples", exist_ok=True)
 
-    # Step 2: 2-Rectified Flowのトレーニング
+    # Step 2: 2-Rectified Flowのトレーニング (修正箇所)
     print("Step 2: Training 2-Rectified Flow with text-conditioned reflow...")
-    labels_sample, _, images_sample = triplets[0]
-    z0_1, z1_1 = instaf.generate_pairs(images_sample, labels_sample)
 
     for epoch in range(epochs):
         total_loss = 0
-        for _ in tqdm(range(len(triplets)), desc=f"Epoch {epoch+1} (2-Rectified)"):
-            loss, _ = instaf.reflow(z0_1, z1_1, labels_sample)
+        # triplets全体を回して学習
+        for labels, noise, images in tqdm(triplets, desc=f"Epoch {epoch+1} (2-Rectified)"):
+            images, labels, noise = images.to(device), labels.to(device), noise.to(device)
+
+            # reflow学習
+            loss, _ = instaf.reflow(images, noise, labels)
             total_loss += loss.item()
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
             optimizer.step()
-        avg_loss = total_loss / len(triplets)
-        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
 
+        avg_loss = total_loss / len(triplets)
+        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.6f}")
+
+        # サンプル生成
         z_sample = torch.randn(16, 3, 32, 32).to(device)
         cond_sample = torch.arange(0, 16).to(device) % 10
         generated = instaf.sample(z_sample, cond_sample)
@@ -420,12 +451,15 @@ def main():
         total_loss = 0
         for labels, noise, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
             images, labels, noise = images.to(device), labels.to(device), noise.to(device)
+
             loss, _ = instaf.distill(images, noise, labels)
             total_loss += loss.item()
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(instaf.parameters(), max_norm=1.0)
             optimizer.step()
+
         avg_loss = total_loss / len(triplets)
         print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
 
@@ -445,3 +479,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
