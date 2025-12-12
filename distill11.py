@@ -15,7 +15,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch_utils.misc
 import torchvision
-from diffusers import StableDiffusionPipeline
 from einops import einsum, rearrange, reduce
 from einops.layers.torch import Rearrange
 from torch.utils.data import DataLoader
@@ -346,18 +345,34 @@ class InstaFlow(nn.Module):
         batchwise_mse = ((z1 - (x0 + vtheta)) ** 2).mean(dim=list(range(1, len(x0.shape))))
         return batchwise_mse.mean(), None
 
-    def distill(self, x, z, cond):
-        b = x.size(0)
-        device = x.device
-        t = torch.rand(b, device=device) * 0.2 + 0.8  # 0.8〜1.0 の範囲
-        vtheta = self.model(z, t, cond)  # モデルの予測
-        batchwise_mse = ((x - z + vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))  # 修正
+    def distill(self, x0, z1, cond):
+        """
+        蒸留: 教師モデルが生成したペア(x0, z1)を使って1ステップで変換を学習
+        x0: 生成された画像 (目標)
+        z1: ノイズ (開始点)
+        目標: z1 から x0 への直接的な変換を学習
+        sample時は z = z - dt * vtheta なので、vtheta は z1 - x0 方向を向く必要がある
+        """
+        b = x0.size(0)
+        device = x0.device
+        # t=1.0 で学習（1ステップ生成を目指すため）
+        t = torch.ones(b, device=device)
+        # モデルに z1 を入力して、x0 への変換ベクトルを予測
+        vtheta = self.model(z1, t, cond)
+        # 目標ベクトルは z1 -> x0 なので、sample時の z = z - dt * vtheta より
+        # vtheta = z1 - x0 である必要がある
+        target_v = z1 - x0
+        batchwise_mse = ((vtheta - target_v) ** 2).mean(dim=list(range(1, len(x0.shape))))
         return batchwise_mse.mean(), None
 
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # ディレクトリの作成
+    os.makedirs("samples", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
 
     epochs = 40
     num_triplets = 50000
@@ -446,12 +461,13 @@ def main():
         total_loss = 0
         for labels, images in tqdm(triplets, desc=f"Epoch {epoch+1} (Distillation)"):
             images, labels = images.to(device), labels.to(device)
-            noises = torch.randn(batch_size, 3, 32, 32).to(device)
 
-            # 毎バッチでペアを生成
-            z0, z1 = instaf2.generate_pairs(images, labels)
+            # 2-Rectified Flowモデルからペア(x0, z1)を生成
+            # x0: 生成された画像, z1: 対応するノイズ
+            x0, z1 = instaf2.generate_pairs(images, labels)
 
-            loss, _ = instaf3.distill(z0, noises, labels)
+            # 生成されたペア(x0, z1)を使って蒸留
+            loss, _ = instaf3.distill(x0, z1, labels)
             total_loss += loss.item()
 
             optimizer3.zero_grad()
